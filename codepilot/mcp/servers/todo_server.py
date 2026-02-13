@@ -1,13 +1,45 @@
-"""TODO MCP server for task tracking and planning."""
+"""TODO MCP server for task tracking and planning.
+
+NOTE: State is persisted to a temp file because the MCP client
+creates a NEW session (subprocess) for each tool call.
+"""
+import json
 import logging
 import os
+import tempfile
 from typing import List, Optional
 
 from fastmcp import FastMCP
 
 app = FastMCP(name="todo")
 
-# In-memory storage for tasks during session
+# File-based persistence (shared across subprocess restarts)
+_STATE_FILE = os.path.join(tempfile.gettempdir(), "codepilot_todo_state.json")
+
+
+def _save() -> None:
+    """Persist tasks to disk."""
+    try:
+        with open(_STATE_FILE, "w") as f:
+            json.dump({"tasks": _tasks, "counter": _task_counter}, f)
+    except Exception:
+        pass
+
+
+def _load() -> None:
+    """Load tasks from disk."""
+    global _tasks, _task_counter
+    try:
+        if os.path.exists(_STATE_FILE):
+            with open(_STATE_FILE, "r") as f:
+                data = json.load(f)
+                _tasks = data.get("tasks", [])
+                _task_counter = data.get("counter", 0)
+    except Exception:
+        pass
+
+
+# In-memory storage (reloaded from disk on each call)
 _tasks: List[dict] = []
 _task_counter = 0
 
@@ -24,6 +56,7 @@ def add_task(title: str, description: str = "") -> str:
         Success message with task ID.
     """
     global _task_counter
+    _load()
     _task_counter += 1
 
     task = {
@@ -34,6 +67,7 @@ def add_task(title: str, description: str = "") -> str:
     }
 
     _tasks.append(task)
+    _save()
     return f"Task added: #{task['id']} {title}"
 
 
@@ -47,9 +81,11 @@ def complete_task(task_id: int) -> str:
     Returns:
         Success message.
     """
+    _load()
     for task in _tasks:
         if task["id"] == task_id:
             task["status"] = "completed"
+            _save()
             return f"Task completed: #{task_id} {task['title']}"
 
     return f"Task not found: #{task_id}"
@@ -62,6 +98,7 @@ def get_next_task() -> Optional[str]:
     Returns:
         Next task or None if all complete.
     """
+    _load()
     for task in _tasks:
         if task["status"] == "pending":
             return f"#{task['id']}: {task['title']}\nDescription: {task['description']}"
@@ -79,6 +116,7 @@ def list_tasks(status: str = "all") -> str:
     Returns:
         Formatted task list.
     """
+    _load()
     if not _tasks:
         return "No tasks yet."
 
@@ -104,9 +142,11 @@ def clear_tasks() -> str:
         Success message.
     """
     global _task_counter
+    _load()
     count = len(_tasks)
     _tasks.clear()
     _task_counter = 0
+    _save()
     return f"Cleared {count} tasks"
 
 
@@ -122,12 +162,14 @@ def update_task(task_id: int, title: str = "", description: str = "") -> str:
     Returns:
         Success message.
     """
+    _load()
     for task in _tasks:
         if task["id"] == task_id:
             if title:
                 task["title"] = title
             if description:
                 task["description"] = description
+            _save()
             return f"Task updated: #{task_id}"
 
     return f"Task not found: #{task_id}"
@@ -140,6 +182,7 @@ def get_progress_status() -> str:
     Returns:
         Progress summary.
     """
+    _load()
     if not _tasks:
         return "No tasks tracked yet."
 

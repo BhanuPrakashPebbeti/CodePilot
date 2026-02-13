@@ -10,17 +10,51 @@ The agent MUST work through a structured plan:
   7. get_plan_status()        — progress summary
 
 Task states: pending → in_progress → done | failed | skipped
+
+NOTE: State is persisted to a temp file because the MCP client
+creates a NEW session (subprocess) for each tool call. In-memory
+state does NOT survive between calls.
 """
 
 import json
 import logging
 import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 from fastmcp import FastMCP
 
 app = FastMCP(name="planning")
+
+
+# ============================================================================
+# FILE-BASED PERSISTENCE
+# ============================================================================
+
+# Use a fixed temp file path so ALL sessions share the same state.
+# This survives across the per-call subprocess restarts.
+_STATE_FILE = os.path.join(tempfile.gettempdir(), "codepilot_plan_state.json")
+
+
+def _save_state(plan_dict: dict) -> None:
+    """Persist plan state to disk."""
+    try:
+        with open(_STATE_FILE, "w") as f:
+            json.dump(plan_dict, f)
+    except Exception:
+        pass  # Best-effort persistence
+
+
+def _load_state() -> Optional[dict]:
+    """Load plan state from disk."""
+    try:
+        if os.path.exists(_STATE_FILE):
+            with open(_STATE_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================================
@@ -35,7 +69,7 @@ def _err(error: str) -> str:
 
 
 # ============================================================================
-# IN-MEMORY PLAN STATE
+# PLAN DATA MODEL
 # ============================================================================
 
 @dataclass
@@ -48,6 +82,16 @@ class Task:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @staticmethod
+    def from_dict(d: dict) -> "Task":
+        return Task(
+            id=d["id"],
+            title=d["title"],
+            status=d.get("status", "pending"),
+            error=d.get("error"),
+            retry_count=d.get("retry_count", 0),
+        )
 
 
 @dataclass
@@ -109,11 +153,30 @@ class Plan:
                 "in_progress": self.in_progress_count,
                 "percent": self.percent,
             },
+            "_counter": self._counter,
         }
 
+    @staticmethod
+    def from_dict(d: dict) -> "Plan":
+        plan = Plan(goal=d.get("goal", ""))
+        plan._counter = d.get("_counter", 0)
+        for t in d.get("tasks", []):
+            plan.tasks.append(Task.from_dict(t))
+        if plan._counter == 0 and plan.tasks:
+            plan._counter = max(t.id for t in plan.tasks)
+        return plan
 
-# Global plan
-_plan = Plan()
+    def save(self) -> None:
+        """Persist current state to disk."""
+        _save_state(self.to_dict())
+
+    @staticmethod
+    def load() -> "Plan":
+        """Load plan from disk, or return empty plan."""
+        data = _load_state()
+        if data:
+            return Plan.from_dict(data)
+        return Plan()
 
 
 # ============================================================================
@@ -131,18 +194,19 @@ def create_plan(goal: str, tasks: str) -> str:
     
     Returns structured plan with task IDs for tracking.
     """
-    global _plan
-    _plan = Plan(goal=goal)
+    plan = Plan(goal=goal)
 
     task_list = [t.strip() for t in tasks.split(",") if t.strip()]
     if not task_list:
         return _err("No tasks provided")
 
     for title in task_list:
-        _plan.add(title)
+        plan.add(title)
+
+    plan.save()
 
     return _ok(
-        _plan.to_dict(),
+        plan.to_dict(),
         f"Plan created: {len(task_list)} tasks for '{goal}'"
     )
 
@@ -154,45 +218,55 @@ def get_current_task() -> str:
     Returns the in-progress task if one exists, otherwise the next pending task.
     If all tasks are done, returns completion status.
     """
+    plan = Plan.load()
+
     # Check for in-progress first
-    current = _plan.current_in_progress()
+    current = plan.current_in_progress()
     if current:
         return _ok(
-            {"task": current.to_dict(), **_plan.to_dict()["progress"]},
+            {"task": current.to_dict(), **plan.to_dict()["progress"]},
             f"In progress: #{current.id} {current.title}"
         )
 
     # Next pending
-    pending = _plan.next_pending()
+    pending = plan.next_pending()
     if pending:
         return _ok(
-            {"task": pending.to_dict(), **_plan.to_dict()["progress"]},
+            {"task": pending.to_dict(), **plan.to_dict()["progress"]},
             f"Next: #{pending.id} {pending.title}"
         )
 
     # All done
-    if _plan.total == 0:
+    if plan.total == 0:
         return _err("No plan created yet. Use create_plan() first.")
 
-    if _plan.failed_count > 0:
-        failed = [t for t in _plan.tasks if t.status == "failed"]
+    if plan.failed_count > 0:
+        failed = [t for t in plan.tasks if t.status == "failed"]
         return _ok(
             {"task": None, "all_done": False, "has_failures": True,
              "failed_tasks": [t.to_dict() for t in failed],
-             **_plan.to_dict()["progress"]},
-            f"All tasks attempted. {_plan.failed_count} failed — consider replan()"
+             **plan.to_dict()["progress"]},
+            f"All tasks attempted. {plan.failed_count} failed — consider replan()"
         )
 
     return _ok(
-        {"task": None, "all_done": True, **_plan.to_dict()["progress"]},
-        f"🎉 All {_plan.total} tasks completed!"
+        {"task": None, "all_done": True, **plan.to_dict()["progress"]},
+        f"🎉 All {plan.total} tasks completed!"
     )
 
 
 @app.tool()
 def start_task(task_id: int) -> str:
-    """Mark a task as in-progress. Call this BEFORE working on a task."""
-    task = _plan.get(task_id)
+    """Mark a task as in-progress. Call this BEFORE working on a task.
+
+    Args:
+        task_id: Integer ID of the task (from create_plan or get_current_task).
+
+    Returns:
+        JSON with the updated task and progress info.
+    """
+    plan = Plan.load()
+    task = plan.get(task_id)
     if not task:
         return _err(f"Task #{task_id} not found")
     if task.status not in ("pending", "failed"):
@@ -200,6 +274,7 @@ def start_task(task_id: int) -> str:
 
     task.status = "in_progress"
     task.error = None
+    plan.save()
     return _ok(
         {"task": task.to_dict()},
         f"Started: #{task_id} {task.title}"
@@ -208,15 +283,24 @@ def start_task(task_id: int) -> str:
 
 @app.tool()
 def complete_task(task_id: int) -> str:
-    """Mark a task as done. Call this AFTER verifying the task works."""
-    task = _plan.get(task_id)
+    """Mark a task as done. Call this AFTER verifying the task works.
+
+    Args:
+        task_id: Integer ID of the task to complete.
+
+    Returns:
+        JSON with progress info and the completed task.
+    """
+    plan = Plan.load()
+    task = plan.get(task_id)
     if not task:
         return _err(f"Task #{task_id} not found")
 
     task.status = "done"
+    plan.save()
     return _ok(
-        {**_plan.to_dict()["progress"], "completed_task": task.to_dict()},
-        f"✓ Done: #{task_id} {task.title} ({_plan.percent:.0f}% complete)"
+        {**plan.to_dict()["progress"], "completed_task": task.to_dict()},
+        f"✓ Done: #{task_id} {task.title} ({plan.percent:.0f}% complete)"
     )
 
 
@@ -229,29 +313,41 @@ def fail_task(task_id: int, error: str = "") -> str:
     - Using replan() to adjust the plan
     - Using skip_task() if it's non-critical
     """
-    task = _plan.get(task_id)
+    plan = Plan.load()
+    task = plan.get(task_id)
     if not task:
         return _err(f"Task #{task_id} not found")
 
     task.status = "failed"
     task.error = error
     task.retry_count += 1
+    plan.save()
 
     return _ok(
-        {"task": task.to_dict(), **_plan.to_dict()["progress"]},
+        {"task": task.to_dict(), **plan.to_dict()["progress"]},
         f"✗ Failed: #{task_id} {task.title} (attempt {task.retry_count})"
     )
 
 
 @app.tool()
 def skip_task(task_id: int, reason: str = "") -> str:
-    """Skip a task (mark as not needed)."""
-    task = _plan.get(task_id)
+    """Skip a task that is no longer needed or not applicable.
+
+    Args:
+        task_id: Integer ID of the task to skip.
+        reason: Why this task is being skipped (optional but recommended).
+
+    Returns:
+        JSON with the updated task.
+    """
+    plan = Plan.load()
+    task = plan.get(task_id)
     if not task:
         return _err(f"Task #{task_id} not found")
 
     task.status = "skipped"
     task.error = reason or "Skipped"
+    plan.save()
     return _ok(
         {"task": task.to_dict()},
         f"⊘ Skipped: #{task_id} {task.title}"
@@ -264,17 +360,19 @@ def add_task(title: str, after_task_id: int = 0) -> str:
     
     Use this when you discover additional work needed during execution.
     """
-    task = _plan.add(title)
+    plan = Plan.load()
+    task = plan.add(title)
 
     # Reorder if after_task_id specified
     if after_task_id > 0:
-        idx = next((i for i, t in enumerate(_plan.tasks) if t.id == after_task_id), None)
+        idx = next((i for i, t in enumerate(plan.tasks) if t.id == after_task_id), None)
         if idx is not None:
-            _plan.tasks.remove(task)
-            _plan.tasks.insert(idx + 1, task)
+            plan.tasks.remove(task)
+            plan.tasks.insert(idx + 1, task)
 
+    plan.save()
     return _ok(
-        {"task": task.to_dict(), "total": _plan.total},
+        {"task": task.to_dict(), "total": plan.total},
         f"Added: #{task.id} {title}"
     )
 
@@ -289,8 +387,10 @@ def replan(reason: str, new_tasks: str = "") -> str:
         reason: Why replanning is needed
         new_tasks: Comma-separated new tasks to add (optional)
     """
+    plan = Plan.load()
+
     # Reset failed tasks to pending
-    for task in _plan.tasks:
+    for task in plan.tasks:
         if task.status == "failed":
             task.status = "pending"
             task.error = None
@@ -299,14 +399,15 @@ def replan(reason: str, new_tasks: str = "") -> str:
     added = []
     if new_tasks:
         for title in [t.strip() for t in new_tasks.split(",") if t.strip()]:
-            t = _plan.add(title)
+            t = plan.add(title)
             added.append(t.to_dict())
 
+    plan.save()
     return _ok(
         {
             "reason": reason,
             "added_tasks": added,
-            **_plan.to_dict()["progress"],
+            **plan.to_dict()["progress"],
         },
         f"Replanned: {reason}. {len(added)} new tasks added."
     )
@@ -315,12 +416,14 @@ def replan(reason: str, new_tasks: str = "") -> str:
 @app.tool()
 def get_plan_status() -> str:
     """Get full plan status with all tasks and progress."""
-    if _plan.total == 0:
+    plan = Plan.load()
+
+    if plan.total == 0:
         return _err("No plan created yet. Use create_plan() first.")
 
     return _ok(
-        _plan.to_dict(),
-        f"Plan: {_plan.done_count}/{_plan.total} done ({_plan.percent:.0f}%)"
+        plan.to_dict(),
+        f"Plan: {plan.done_count}/{plan.total} done ({plan.percent:.0f}%)"
     )
 
 

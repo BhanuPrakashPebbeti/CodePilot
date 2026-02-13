@@ -187,12 +187,24 @@ def check_runtime(name: str, min_version: str = "") -> str:
 
 
 @app.tool()
-def get_install_command(runtime: str) -> str:
-    """Get the recommended install command for a runtime.
-    
-    Returns the appropriate package manager command based on the OS.
-    NOTE: This only returns the command — it must be approved via permissions.
+def get_install_command(runtime: str = "") -> str:
+    """Get the recommended install command for a missing runtime.
+
+    Args:
+        runtime: REQUIRED — The name of the runtime to install.
+                 Examples: "node", "python3", "go", "rustc", "java", "docker"
+
+    Returns:
+        JSON with OS-appropriate install commands. Does NOT install anything.
     """
+    runtime = runtime.strip().lower()
+    if not runtime:
+        return _err(
+            "Missing 'runtime' argument. You must specify what to install. "
+            "Example: get_install_command(runtime='node'). "
+            "Or skip this tool and use run_command directly: "
+            "run_command(command='sudo apt-get install -y nodejs npm')"
+        )
     suggestions = _get_install_suggestions(runtime)
 
     return _ok(
@@ -202,8 +214,129 @@ def get_install_command(runtime: str) -> str:
 
 
 @app.tool()
+def install_runtime(runtime: str = "", method: str = "") -> str:
+    """Attempt to install a runtime. Tries non-sudo methods first.
+
+    IMPORTANT: You MUST pass the 'runtime' argument.
+
+    Args:
+        runtime: REQUIRED — The name of the runtime to install.
+                 Examples: "node", "go", "rustc"
+        method: Specific install method (optional).
+                For node: "nvm" (default), "apt"
+
+    For Node.js: tries nvm (no sudo needed).
+    For Rust: tries rustup (no sudo needed).
+    If non-sudo fails, returns the exact sudo command to run via
+    the run_command tool (which supports interactive sudo password).
+    """
+    runtime = runtime.strip().lower()
+    if not runtime:
+        return _err(
+            "Missing 'runtime' argument. You must specify what to install. "
+            "Example: install_runtime(runtime='node'). "
+            "Or skip this tool and use run_command directly: "
+            "run_command(command='sudo apt-get install -y nodejs npm')"
+        )
+
+    # ── Node.js via nvm (no sudo) ──────────────────────────────────
+    if runtime in ("node", "nodejs", "npm"):
+        # Check if nvm already available
+        nvm_check = _run('bash -c "source $HOME/.nvm/nvm.sh 2>/dev/null && nvm --version"')
+        if nvm_check["success"]:
+            result = _run(
+                'bash -c "source $HOME/.nvm/nvm.sh && nvm install --lts && nvm use --lts"',
+                timeout=120
+            )
+            if result["success"]:
+                node_ver = _run('bash -c "source $HOME/.nvm/nvm.sh && node --version"')
+                return _ok(
+                    {"runtime": "node", "installed": True,
+                     "version": node_ver["stdout"], "method": "nvm",
+                     "activate": "source $HOME/.nvm/nvm.sh",
+                     "note": "Run 'source ~/.nvm/nvm.sh' or restart terminal to use."},
+                    f"Node.js installed via nvm: {node_ver['stdout']}"
+                )
+
+        # nvm not available — try installing nvm first, then node
+        if method != "apt":
+            result = _run(
+                'bash -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"',
+                timeout=120
+            )
+            if result["success"]:
+                result2 = _run(
+                    'bash -c "source $HOME/.nvm/nvm.sh && nvm install --lts"',
+                    timeout=120
+                )
+                if result2["success"]:
+                    node_ver = _run('bash -c "source $HOME/.nvm/nvm.sh && node --version"')
+                    return _ok(
+                        {"runtime": "node", "installed": True,
+                         "version": node_ver["stdout"], "method": "nvm",
+                         "activate": "source $HOME/.nvm/nvm.sh",
+                         "note": "Installed via nvm. Run 'source ~/.nvm/nvm.sh' or restart terminal."},
+                        f"Node.js installed via nvm: {node_ver['stdout']}. "
+                        f"Run 'source ~/.nvm/nvm.sh' to activate."
+                    )
+
+        # Fallback — tell the LLM to use run_command with sudo
+        return _ok(
+            {"runtime": "node", "installed": False,
+             "requires_sudo": True,
+             "use_run_command": "sudo apt-get install -y nodejs npm",
+             "instructions": (
+                 "Non-sudo install failed. Use the run_command tool to run: "
+                 "sudo apt-get install -y nodejs npm  — "
+                 "The user will be prompted for their password."
+             )},
+            "Non-sudo install failed. Use run_command tool with: "
+            "sudo apt-get install -y nodejs npm"
+        )
+
+    # ── Rust via rustup (no sudo) ──────────────────────────────────
+    elif runtime in ("rustc", "rust", "cargo"):
+        result = _run(
+            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+            timeout=120
+        )
+        if result["success"]:
+            return _ok(
+                {"runtime": "rust", "installed": True, "method": "rustup",
+                 "activate": "source $HOME/.cargo/env",
+                 "note": "Run 'source $HOME/.cargo/env' to activate."},
+                "Rust installed via rustup"
+            )
+
+    # ── Generic fallback ───────────────────────────────────────────
+    suggestions = _get_install_suggestions(runtime)
+    # Build a direct sudo command if possible
+    sudo_cmd = suggestions[0] if suggestions else f"sudo apt-get install -y {runtime}"
+    return _ok(
+        {"runtime": runtime, "installed": False,
+         "requires_sudo": True,
+         "use_run_command": sudo_cmd,
+         "instructions": (
+             f"Cannot install {runtime} without sudo. "
+             f"Use the run_command tool to run: {sudo_cmd}"
+         )},
+        f"Cannot auto-install {runtime}. Use run_command tool with: {sudo_cmd}"
+    )
+
+
+@app.tool()
 def check_venv(directory: str = ".") -> str:
-    """Check if a Python virtual environment exists in the directory."""
+    """Check if a Python virtual environment exists in or near a directory.
+
+    Looks for common venv directories: venv, .venv, env, .env.
+    Returns the venv path, Python executable, and version if found.
+
+    Args:
+        directory: Directory to search in (default: current directory).
+
+    Returns:
+        JSON with exists, path, python executable path, and version.
+    """
     root = Path(directory).resolve()
 
     venv_dirs = ["venv", ".venv", "env", ".env"]
@@ -232,7 +365,15 @@ def check_venv(directory: str = ".") -> str:
 
 @app.tool()
 def create_venv(directory: str = ".", name: str = "venv") -> str:
-    """Create a Python virtual environment."""
+    """Create a new Python virtual environment using python3 -m venv.
+
+    Args:
+        directory: Parent directory where the venv will be created (default: current directory).
+        name: Name of the venv directory (default: "venv").
+
+    Returns:
+        JSON with the venv path and the activation command.
+    """
     root = Path(directory).resolve()
     venv_path = root / name
 
@@ -250,7 +391,18 @@ def create_venv(directory: str = ".", name: str = "venv") -> str:
 
 @app.tool()
 def check_node_project(directory: str = ".") -> str:
-    """Check if a Node.js project is properly set up."""
+    """Check if a Node.js project is properly set up in a directory.
+
+    Checks for package.json, node_modules, and lock files.
+    Returns project metadata including scripts and dependency counts.
+
+    Args:
+        directory: Directory to check (default: current directory).
+
+    Returns:
+        JSON with has_package_json, has_node_modules, has_lock_file,
+        name, scripts, dependencies_count, dev_dependencies_count.
+    """
     root = Path(directory).resolve()
     status = {
         "has_package_json": (root / "package.json").exists(),

@@ -105,16 +105,12 @@ TOOL_LABELS = {
     # File reads
     "read_file":         "Read",
     "read_lines":        "Read",
-    "count_lines":       "Count",
     "file_exists":       "Check",
     "get_file_info":     "Inspect",
-    "file_summary":      "Summarize",
     # Directories
     "create_directory":         "Create dir",
     "create_project_structure": "Scaffold",
     "list_directory":           "List",
-    "list_dir":                 "List",
-    "project_tree":             "Tree",
     # Bash
     "run_command":         "Run",
     "run_python":          "Python",
@@ -123,6 +119,11 @@ TOOL_LABELS = {
     "npm_run":             "npm run",
     "check_tools_available": "Check tools",
     "get_system_info":     "System info",
+    # Background process management
+    "start_background_process": "Start server",
+    "stop_background_process":  "Stop server",
+    "wait_for_port":            "Wait for port",
+    "get_background_output":    "Server log",
     # Workspace
     "detect_project":      "Detect project",
     "get_project_tree":    "Project tree",
@@ -161,7 +162,7 @@ TOOL_LABELS = {
     "git_create_branch": "git branch",
     "git_checkout":      "git checkout",
     "git_info":          "git info",
-    # Tasks
+    # Planning / Tasks
     "create_plan":       "Plan",
     "get_current_task":  "Next task",
     "start_task":        "Start task",
@@ -176,18 +177,34 @@ TOOL_LABELS = {
     "update_task":       "Update task",
     "get_next_task":     "Next task",
     "get_progress_status":"Progress",
+    # Environment
+    "detect_runtimes":     "Detect runtimes",
+    "check_runtime":       "Check runtime",
+    "get_install_command": "Install cmd",
+    "install_runtime":     "Install runtime",
+    "check_venv":          "Check venv",
+    "create_venv":         "Create venv",
+    "check_node_project":  "Check Node.js",
+    # GitHub
+    "create_repo":         "Create repo",
+    "push_to_github":      "Push",
+    "open_pull_request":   "Open PR",
+    "get_repo_info":       "Repo info",
+    "list_pull_requests":  "List PRs",
+    "get_github_user":     "GitHub user",
 }
 
 # Tool categories for icon selection
 _FILE_WRITE  = {"write_file","create_file","append_file","edit_lines","edit_line",
                 "insert_lines","delete_lines","replace_in_file","copy_file",
                 "move_file","delete_file"}
-_FILE_READ   = {"read_file","read_lines","count_lines","file_exists",
-                "get_file_info","file_summary"}
-_DIR         = {"create_directory","create_project_structure","list_directory",
-                "list_dir","project_tree"}
+_FILE_READ   = {"read_file","read_lines","file_exists",
+                "get_file_info"}
+_DIR         = {"create_directory","create_project_structure","list_directory"}
 _BASH        = {"run_command","run_python","pip_install","npm_install",
-                "npm_run","check_tools_available","get_system_info"}
+                "npm_run","check_tools_available","get_system_info",
+                "start_background_process","stop_background_process",
+                "wait_for_port","get_background_output"}
 _TEST        = {"run_pytest","run_npm_test","run_single_test",
                 "check_python_syntax","check_json_syntax","lint_python",
                 "verify_server_starts","assert_file_exists",
@@ -204,18 +221,24 @@ _TASK        = {"create_plan","get_current_task","start_task","complete_task",
                 "fail_task","skip_task","add_task","replan","get_plan_status",
                 "list_tasks","clear_tasks","update_task","get_next_task",
                 "get_progress_status"}
+_ENVIRONMENT = {"detect_runtimes","check_runtime","get_install_command",
+                "install_runtime","check_venv","create_venv","check_node_project"}
+_GITHUB      = {"create_repo","push_to_github","open_pull_request",
+                "get_repo_info","list_pull_requests","get_github_user"}
 
 
 def _tool_icon(name: str) -> str:
-    if name in _FILE_WRITE: return "📝"
-    if name in _FILE_READ:  return "📖"
-    if name in _DIR:        return "📁"
-    if name in _BASH:       return "💻"
-    if name in _TEST:       return "🧪"
-    if name in _DEBUG:      return "🔍"
-    if name in _GIT:        return "🔀"
-    if name in _WORKSPACE:  return "🗂 "
-    if name in _TASK:       return "📋"
+    if name in _FILE_WRITE:  return "📝"
+    if name in _FILE_READ:   return "📖"
+    if name in _DIR:         return "📁"
+    if name in _BASH:        return "💻"
+    if name in _TEST:        return "🧪"
+    if name in _DEBUG:       return "🔍"
+    if name in _GIT:         return "🔀"
+    if name in _WORKSPACE:   return "🗂 "
+    if name in _TASK:        return "📋"
+    if name in _ENVIRONMENT: return "🌍"
+    if name in _GITHUB:      return "🐙"
     return "⚙ "
 
 
@@ -227,6 +250,8 @@ def _infer_phase(tool_name: str) -> Phase:
         return Phase.PLAN
     if tool_name in (_FILE_WRITE | _DIR | _BASH):
         return Phase.EXECUTE
+    if tool_name in (_ENVIRONMENT):
+        return Phase.PLAN
     if tool_name in _TEST:
         return Phase.VERIFY
     if tool_name in _DEBUG:
@@ -291,12 +316,45 @@ class Renderer:
             return
         self._thinking_buffer += text
 
+    @staticmethod
+    def _strip_tool_call_noise(text: str) -> str:
+        """Remove raw <tool_call> JSON that some models emit as text.
+
+        Weak models sometimes output raw XML-style tool calls instead of
+        using the proper function-calling mechanism. These look like:
+            <tool_call>{"name":"create_file","arguments":{...}}</tool_call>
+        Strip them so they don't leak into the terminal output.
+        """
+        # Remove complete <tool_call>...</tool_call> blocks (single-line or multi-line)
+        cleaned = re.sub(
+            r"</?tool_call>",
+            "",
+            text,
+            flags=re.DOTALL,
+        )
+        # Also remove bare JSON that looks like a tool call dict
+        # e.g. {"name": "create_file", "arguments": {...}}
+        cleaned = re.sub(
+            r'\{"name"\s*:\s*"[a-z_]+"\s*,\s*"arguments"\s*:\s*\{.*?\}\s*\}',
+            "",
+            cleaned,
+            flags=re.DOTALL,
+        )
+        return cleaned
+
     def flush_thinking(self) -> None:
         """Flush accumulated thinking text to terminal."""
         text = self._thinking_buffer.strip()
         if not text:
             return
         self._thinking_buffer = ""
+
+        # Filter out raw <tool_call> JSON that weak models emit as text
+        text = self._strip_tool_call_noise(text)
+        text = text.strip()
+        if not text:
+            return
+
         self._last_thinking_had_content = True
         # Show thinking as indented dim text — compact, no panel
         lines = text.split("\n")
