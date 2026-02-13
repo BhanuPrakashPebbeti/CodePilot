@@ -30,13 +30,38 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(default=8192, ge=100, le=100000)  # Increased for complex tasks
     base_url: Optional[str] = None
     provider_preference: Optional[str] = Field(default=None, pattern="^(openrouter|ollama)?$")  # User's preferred provider
-    openrouter_models: List[str] = Field(default_factory=list)  # OpenRouter models
+    openrouter_models: List[str] = Field(default_factory=list)  # OpenRouter models list
+    
+    # Per-provider model storage (so editing one doesn't clobber the other)
+    openrouter_model: Optional[str] = None   # last-selected OpenRouter model
+    ollama_model: Optional[str] = None       # last-selected Ollama model
     
     # Single key mode
     api_key: Optional[str] = None
     
     # Multi-key mode
     api_keys: List[APIKey] = Field(default_factory=list)
+    
+    @property
+    def active_provider(self) -> str:
+        """The provider that should actually be used, based on preference."""
+        if self.provider_preference:
+            return self.provider_preference
+        # Auto: prefer openrouter if key exists, else ollama
+        if self.has_any_key:
+            return "openrouter"
+        return "ollama"
+    
+    @property
+    def active_model(self) -> str:
+        """The model for the active provider."""
+        prov = self.active_provider
+        if prov == "openrouter" and self.openrouter_model:
+            return self.openrouter_model
+        if prov == "ollama" and self.ollama_model:
+            return self.ollama_model
+        # Fallback to legacy 'model' field
+        return self.model
     
     @property
     def has_single_key(self) -> bool:

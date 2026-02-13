@@ -2,6 +2,8 @@
 
 from .agent import CodePilotAgent, create_agent
 from .exceptions import CodePilotError, ConfigurationError, LLMError, SessionError
+from .permissions import PermissionGate, PermissionLevel
+from .renderer import Renderer
 from .session import SessionManager
 
 __all__ = [
@@ -11,5 +13,8 @@ __all__ = [
     "ConfigurationError",
     "LLMError",
     "SessionError",
+    "PermissionGate",
+    "PermissionLevel",
+    "Renderer",
     "SessionManager",
 ]

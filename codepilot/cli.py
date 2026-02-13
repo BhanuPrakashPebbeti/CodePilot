@@ -208,8 +208,8 @@ def run_command(
         
         # Display provider/model info
         config = config_manager.config
-        provider = config.llm.provider_preference or "auto"
-        model = config.llm.model
+        provider = config.llm.active_provider
+        model = config.llm.active_model
         console.print(f"[dim]Provider: {provider} | Model: {model}[/dim]\n")
         
         # Create agent
@@ -331,9 +331,13 @@ def config_init() -> None:
 
 
 def _update_provider_config(config_manager: ConfigManager, provider: str) -> None:
-    """Update provider configuration (OpenRouter or Ollama)."""
+    """Update provider configuration (OpenRouter or Ollama).
+    
+    Writes the selected model to the per-provider field (openrouter_model
+    or ollama_model) so switching providers doesn't clobber the other
+    provider's model selection.
+    """
     config = config_manager.config
-    config.llm.provider = provider
     
     if provider == PROVIDER_OPENROUTER:
         console.print("\n[cyan]OpenRouter Configuration:[/cyan]")
@@ -366,9 +370,12 @@ def _update_provider_config(config_manager: ConfigManager, provider: str) -> Non
         )
         
         if model_choice == str(start_index):
-            config.llm.model = Prompt.ask("Enter model name")
+            selected_model = Prompt.ask("Enter model name")
         else:
-            config.llm.model = models[model_choice]
+            selected_model = models[model_choice]
+        
+        # Store in per-provider field (doesn't touch ollama_model)
+        config.llm.openrouter_model = selected_model
     else:
         console.print("\n[cyan]Ollama Configuration:[/cyan]")
         console.print("[dim]Make sure Ollama is running on http://localhost:11434[/dim]\n")
@@ -392,9 +399,12 @@ def _update_provider_config(config_manager: ConfigManager, provider: str) -> Non
         }
         
         if model_choice == "4":
-            config.llm.model = Prompt.ask("Enter model name")
+            selected_model = Prompt.ask("Enter model name")
         else:
-            config.llm.model = models[model_choice]
+            selected_model = models[model_choice]
+        
+        # Store in per-provider field (doesn't touch openrouter_model)
+        config.llm.ollama_model = selected_model
     
     config_manager._save()
     console.print(f"[green]✓ {provider.title()} configuration updated[/green]")
@@ -531,10 +541,24 @@ def config_show() -> None:
         table.add_column("Setting", style="cyan")
         table.add_column("Value", style="green")
         
-        table.add_row("Provider", config.llm.provider)
-        table.add_row("Model", config.llm.model)
+        # Show the ACTIVE provider/model (determined by preference)
+        active_prov = config.llm.active_provider
+        active_model = config.llm.active_model
+        pref = config.llm.provider_preference or "auto"
+        
+        table.add_row("Provider", active_prov)
+        table.add_row("Model", active_model)
+        table.add_row("Preference", pref)
         table.add_row("Temperature", str(config.llm.temperature))
         table.add_row("Max Tokens", str(config.llm.max_tokens))
+        
+        # Show per-provider models if configured
+        or_model = config.llm.openrouter_model
+        ol_model = config.llm.ollama_model
+        if or_model:
+            table.add_row("OpenRouter Model", or_model)
+        if ol_model:
+            table.add_row("Ollama Model", ol_model)
         
         # API key status
         if config.llm.has_single_key:

@@ -1,14 +1,46 @@
-"""Filesystem MCP server with fine-grained file tools."""
+"""Filesystem MCP server — production-grade file operations.
 
+Every tool returns a JSON string with a consistent schema:
+  {"ok": true/false, "data": ..., "error": ...}
+
+This lets the agent reliably parse results and chain operations.
+"""
+
+import json
 import logging
 import os
+import re
+import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastmcp import FastMCP
 
 app = FastMCP(name="filesystem")
 
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def _ok(data: Any = None, message: str = "") -> str:
+    """Return a success JSON response."""
+    return json.dumps({"ok": True, "data": data, "message": message})
+
+
+def _err(error: str) -> str:
+    """Return an error JSON response."""
+    return json.dumps({"ok": False, "error": error})
+
+
+def _resolve(path: str) -> Path:
+    """Resolve path (supports relative and absolute)."""
+    return Path(path).resolve()
+
+
+# ============================================================================
+# READ OPERATIONS
+# ============================================================================
 
 @app.tool()
 def read_file(path: str) -> str:
@@ -18,25 +50,29 @@ def read_file(path: str) -> str:
         path: Path to file (relative or absolute).
 
     Returns:
-        File content.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
-        IsADirectoryError: If path is a directory.
+        JSON with file content, line count, and size.
     """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-    if file_path.is_dir():
-        raise IsADirectoryError(f"Path is a directory: {path}")
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
+        if fp.is_dir():
+            return _err(f"Path is a directory: {path}")
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
+        content = fp.read_text(encoding="utf-8", errors="replace")
+        return _ok({
+            "path": str(fp),
+            "content": content,
+            "lines": len(content.splitlines()),
+            "size": fp.stat().st_size,
+        })
+    except Exception as e:
+        return _err(str(e))
 
 
 @app.tool()
 def read_lines(path: str, start: int, end: int) -> str:
-    """Read specific lines from file.
+    """Read specific line range from file (1-indexed, inclusive).
 
     Args:
         path: Path to file.
@@ -44,548 +80,501 @@ def read_lines(path: str, start: int, end: int) -> str:
         end: End line number (1-indexed, inclusive).
 
     Returns:
-        Content of specified lines.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
+        JSON with the requested lines.
     """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+        all_lines = fp.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        start_idx = max(0, start - 1)
+        end_idx = min(len(all_lines), end)
+        selected = all_lines[start_idx:end_idx]
 
-    # Convert to 0-indexed
-    start_idx = max(0, start - 1)
-    end_idx = min(len(lines), end)
-
-    return "".join(lines[start_idx:end_idx])
+        return _ok({
+            "path": str(fp),
+            "start": start,
+            "end": min(end, len(all_lines)),
+            "total_lines": len(all_lines),
+            "content": "".join(selected),
+        })
+    except Exception as e:
+        return _err(str(e))
 
 
 @app.tool()
-def write_file(path: str, content: str) -> str:
-    """Write content to file (overwrite if exists).
+def get_file_info(path: str) -> str:
+    """Get file metadata (size, line count, modified time).
 
     Args:
         path: Path to file.
-        content: Content to write.
 
     Returns:
-        Success message.
+        JSON with file metadata.
     """
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content)
+        stat = fp.stat()
+        lines = 0
+        if fp.is_file():
+            try:
+                lines = len(fp.read_text(encoding="utf-8", errors="replace").splitlines())
+            except Exception:
+                pass
 
-    return f"File written: {path}"
+        return _ok({
+            "path": str(fp),
+            "name": fp.name,
+            "extension": fp.suffix,
+            "is_file": fp.is_file(),
+            "is_dir": fp.is_dir(),
+            "size_bytes": stat.st_size,
+            "lines": lines,
+            "modified": stat.st_mtime,
+        })
+    except Exception as e:
+        return _err(str(e))
+
+
+# ============================================================================
+# WRITE OPERATIONS
+# ============================================================================
+
+@app.tool()
+def write_file(path: str, content: str) -> str:
+    """Write content to file (creates parent dirs, overwrites if exists).
+
+    Args:
+        path: Path to file.
+        content: Full file content.
+
+    Returns:
+        JSON with result.
+    """
+    try:
+        fp = _resolve(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content, encoding="utf-8")
+        return _ok({
+            "path": str(fp),
+            "lines": len(content.splitlines()),
+            "size": fp.stat().st_size,
+        }, f"File written: {path}")
+    except Exception as e:
+        return _err(str(e))
+
+
+@app.tool()
+def create_file(path: str, content: str = "") -> str:
+    """Create a new file with optional content. Fails if file already exists.
+
+    Args:
+        path: Path to file.
+        content: Optional initial content.
+
+    Returns:
+        JSON with result.
+    """
+    try:
+        fp = _resolve(path)
+        if fp.exists():
+            return _err(f"File already exists: {path}. Use write_file to overwrite.")
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content, encoding="utf-8")
+        return _ok({"path": str(fp)}, f"File created: {path}")
+    except Exception as e:
+        return _err(str(e))
 
 
 @app.tool()
 def append_file(path: str, content: str) -> str:
-    """Append content to file.
+    """Append content to end of file.
 
     Args:
         path: Path to file.
         content: Content to append.
 
     Returns:
-        Success message.
+        JSON with result.
     """
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fp = _resolve(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        with open(fp, "a", encoding="utf-8") as f:
+            f.write(content)
+        return _ok({"path": str(fp)}, f"Appended to: {path}")
+    except Exception as e:
+        return _err(str(e))
 
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(content)
 
-    return f"Content appended to: {path}"
-
+# ============================================================================
+# EDIT OPERATIONS
+# ============================================================================
 
 @app.tool()
 def replace_in_file(path: str, search: str, replace: str) -> str:
-    """Replace text in file.
+    """Find and replace text in file. Returns count of replacements.
 
     Args:
         path: Path to file.
-        search: Text to find.
+        search: Exact text to find.
         replace: Text to replace with.
 
     Returns:
-        Success message with count of replacements.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
+        JSON with replacement count.
     """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
+        content = fp.read_text(encoding="utf-8")
+        count = content.count(search)
 
-    new_content = content.replace(search, replace)
-    count = content.count(search)
+        if count == 0:
+            return _err(f"Search text not found in {path}")
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
+        new_content = content.replace(search, replace)
+        fp.write_text(new_content, encoding="utf-8")
 
-    return f"Replaced {count} occurrence(s) in {path}"
+        return _ok({
+            "path": str(fp),
+            "replacements": count,
+        }, f"Replaced {count} occurrence(s)")
+    except Exception as e:
+        return _err(str(e))
 
 
 @app.tool()
-def create_file(path: str, content: str = "") -> str:
-    """Create file with optional content.
+def edit_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
+    """Replace a range of lines with new content.
 
     Args:
         path: Path to file.
-        content: Optional content to write (default: empty file).
+        start_line: First line to replace (1-indexed).
+        end_line: Last line to replace (1-indexed, inclusive).
+        new_content: New content to insert in place of the range.
 
     Returns:
-        Success message.
+        JSON with result.
     """
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    
-    if content:
-        return f"File created with content: {path}"
-    return f"Empty file created: {path}"
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
 
-    return f"File created: {path}"
+        lines = fp.read_text(encoding="utf-8").splitlines(keepends=True)
+        start_idx = max(0, start_line - 1)
+        end_idx = min(len(lines), end_line)
+
+        new_lines = new_content.split("\n")
+        new_lines = [line + "\n" for line in new_lines[:-1]] + [new_lines[-1]]
+
+        result_lines = lines[:start_idx] + new_lines + lines[end_idx:]
+        fp.write_text("".join(result_lines), encoding="utf-8")
+
+        return _ok({
+            "path": str(fp),
+            "lines_replaced": end_idx - start_idx,
+            "new_line_count": len(new_lines),
+            "total_lines": len(result_lines),
+        }, f"Lines {start_line}-{end_line} replaced")
+    except Exception as e:
+        return _err(str(e))
 
 
 @app.tool()
-def delete_file(path: str) -> str:
-    """Delete file.
+def insert_lines(path: str, after_line: int, content: str) -> str:
+    """Insert content after a specific line number.
 
     Args:
         path: Path to file.
+        after_line: Insert after this line (0 = insert at top).
+        content: Content to insert.
 
     Returns:
-        Success message.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
+        JSON with result.
     """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
 
-    file_path.unlink()
-    return f"File deleted: {path}"
+        lines = fp.read_text(encoding="utf-8").splitlines(keepends=True)
+        insert_idx = max(0, min(after_line, len(lines)))
+
+        new_lines = content.split("\n")
+        new_lines = [line + "\n" for line in new_lines]
+
+        result_lines = lines[:insert_idx] + new_lines + lines[insert_idx:]
+        fp.write_text("".join(result_lines), encoding="utf-8")
+
+        return _ok({
+            "path": str(fp),
+            "inserted_at": insert_idx + 1,
+            "lines_inserted": len(new_lines),
+            "total_lines": len(result_lines),
+        })
+    except Exception as e:
+        return _err(str(e))
 
 
 @app.tool()
-def list_dir(path: str = ".") -> str:
-    """List directory contents.
+def delete_lines(path: str, start_line: int, end_line: int) -> str:
+    """Delete a range of lines from file.
+
+    Args:
+        path: Path to file.
+        start_line: First line to delete (1-indexed).
+        end_line: Last line to delete (1-indexed, inclusive).
+
+    Returns:
+        JSON with result.
+    """
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
+
+        lines = fp.read_text(encoding="utf-8").splitlines(keepends=True)
+        start_idx = max(0, start_line - 1)
+        end_idx = min(len(lines), end_line)
+
+        result_lines = lines[:start_idx] + lines[end_idx:]
+        fp.write_text("".join(result_lines), encoding="utf-8")
+
+        return _ok({
+            "path": str(fp),
+            "lines_deleted": end_idx - start_idx,
+            "total_lines": len(result_lines),
+        })
+    except Exception as e:
+        return _err(str(e))
+
+
+# ============================================================================
+# DIRECTORY OPERATIONS
+# ============================================================================
+
+@app.tool()
+def create_directory(path: str) -> str:
+    """Create directory (and all parents).
 
     Args:
         path: Directory path.
 
     Returns:
-        Directory listing with file types.
-
-    Raises:
-        NotADirectoryError: If path is not a directory.
+        JSON with result.
     """
-    dir_path = Path(path)
-    if not dir_path.is_dir():
-        raise NotADirectoryError(f"Not a directory: {path}")
-
-    items = []
     try:
-        for item in sorted(dir_path.iterdir()):
-            item_type = "dir" if item.is_dir() else "file"
-            items.append(f"{item.name:<50} ({item_type})")
-    except PermissionError:
-        return f"Permission denied: {path}"
-
-    return "\n".join(items) if items else f"Empty directory: {path}"
+        fp = _resolve(path)
+        fp.mkdir(parents=True, exist_ok=True)
+        return _ok({"path": str(fp)}, f"Directory created: {path}")
+    except Exception as e:
+        return _err(str(e))
 
 
 @app.tool()
-def file_exists(path: str) -> bool:
-    """Check if file exists.
+def list_directory(path: str = ".") -> str:
+    """List directory contents with type info.
+
+    Args:
+        path: Directory path.
+
+    Returns:
+        JSON with list of entries (name, type, size).
+    """
+    try:
+        dp = _resolve(path)
+        if not dp.is_dir():
+            return _err(f"Not a directory: {path}")
+
+        entries = []
+        for item in sorted(dp.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+            entry = {"name": item.name, "type": "dir" if item.is_dir() else "file"}
+            if item.is_file():
+                entry["size"] = item.stat().st_size
+                entry["extension"] = item.suffix
+            entries.append(entry)
+
+        return _ok({"path": str(dp), "count": len(entries), "entries": entries})
+    except Exception as e:
+        return _err(str(e))
+
+
+@app.tool()
+def create_project_structure(base_path: str, directories: str) -> str:
+    """Create multiple directories at once for project scaffolding.
+
+    Args:
+        base_path: Base project directory.
+        directories: Comma-separated subdirectory paths.
+
+    Returns:
+        JSON with created directories.
+    """
+    try:
+        base = _resolve(base_path)
+        base.mkdir(parents=True, exist_ok=True)
+
+        dirs = [d.strip() for d in directories.split(",") if d.strip()]
+        created = []
+        for d in dirs:
+            full = base / d
+            full.mkdir(parents=True, exist_ok=True)
+            created.append(d)
+
+        return _ok({
+            "base": str(base),
+            "directories_created": created,
+            "count": len(created),
+        })
+    except Exception as e:
+        return _err(str(e))
+
+
+# ============================================================================
+# FILE MANAGEMENT
+# ============================================================================
+
+@app.tool()
+def delete_file(path: str) -> str:
+    """Delete a file.
 
     Args:
         path: Path to file.
 
     Returns:
-        True if file exists.
+        JSON with result.
     """
-    return Path(path).exists()
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
+        if fp.is_dir():
+            return _err(f"Path is a directory: {path}")
+        fp.unlink()
+        return _ok({"path": str(fp)}, f"File deleted: {path}")
+    except Exception as e:
+        return _err(str(e))
 
 
 @app.tool()
-def project_tree() -> str:
-    """Get project directory tree structure.
+def move_file(source: str, destination: str) -> str:
+    """Move or rename a file.
+
+    Args:
+        source: Source path.
+        destination: Destination path.
 
     Returns:
-        Directory tree visualization.
+        JSON with result.
     """
-    root = Path(".")
-    tree_lines = []
+    try:
+        src = _resolve(source)
+        dst = _resolve(destination)
+        if not src.exists():
+            return _err(f"Source not found: {source}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        return _ok({"source": str(src), "destination": str(dst)})
+    except Exception as e:
+        return _err(str(e))
 
-    def add_tree(path: Path, prefix: str = "", is_last: bool = True):
-        """Recursively add directory contents to tree."""
-        if len(tree_lines) > 1000:  # Limit output
-            return
 
-        # Skip common ignored directories
-        skip_dirs = {
-            ".git",
-            "__pycache__",
-            ".pytest_cache",
-            ".venv",
-            "venv",
-            "node_modules",
-            "dist",
-            "build",
-            ".forgecode",
-            ".egg-info",
-        }
+@app.tool()
+def copy_file(source: str, destination: str) -> str:
+    """Copy a file.
 
-        if path.name in skip_dirs:
-            return
+    Args:
+        source: Source path.
+        destination: Destination path.
+
+    Returns:
+        JSON with result.
+    """
+    try:
+        src = _resolve(source)
+        dst = _resolve(destination)
+        if not src.exists():
+            return _err(f"Source not found: {source}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return _ok({"source": str(src), "destination": str(dst)})
+    except Exception as e:
+        return _err(str(e))
+
+
+@app.tool()
+def file_exists(path: str) -> str:
+    """Check if a path exists and whether it is a file or directory.
+
+    Args:
+        path: Path to check.
+
+    Returns:
+        JSON with existence info.
+    """
+    fp = _resolve(path)
+    return _ok({"path": str(fp), "exists": fp.exists(), "is_file": fp.is_file(), "is_dir": fp.is_dir()})
+
+
+# ============================================================================
+# SEARCH
+# ============================================================================
+
+@app.tool()
+def search_in_files(directory: str, query: str, file_pattern: str = "*", max_results: int = 50) -> str:
+    """Search for text across files in a directory.
+
+    Args:
+        directory: Root directory to search.
+        query: Text to search for (case-insensitive).
+        file_pattern: Glob pattern to filter files.
+        max_results: Maximum number of matches.
+
+    Returns:
+        JSON with matches (file, line, text).
+    """
+    try:
+        root = _resolve(directory)
+        skip = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", "target"}
 
         try:
-            items = sorted(path.iterdir())
-        except PermissionError:
-            return
+            pattern = re.compile(query, re.IGNORECASE)
+        except re.error:
+            pattern = re.compile(re.escape(query), re.IGNORECASE)
 
-        dirs = [item for item in items if item.is_dir()]
-        files = [item for item in items if item.is_file()]
-
-        for i, item in enumerate(dirs + files):
-            is_last_item = i == len(dirs) + len(files) - 1
-            current_prefix = "└── " if is_last_item else "├── "
-            tree_lines.append(prefix + current_prefix + item.name)
-
-            if item.is_dir():
-                next_prefix = prefix + ("    " if is_last_item else "│   ")
-                add_tree(item, next_prefix, is_last_item)
-
-    tree_lines.append(".")
-    add_tree(root)
-
-    return "\n".join(tree_lines[:1000])
-
-
-@app.tool()
-def file_summary(file_path: Optional[str] = None) -> str:
-    """Get summary of files in project.
-
-    Args:
-        file_path: Optional specific file path.
-
-    Returns:
-        Summary of files.
-    """
-    if file_path:
-        path = Path(file_path)
-        if not path.exists():
-            return f"File not found: {file_path}"
-
-        if path.is_file():
-            size = path.stat().st_size
-            lines = len(path.read_text(encoding="utf-8", errors="ignore").splitlines())
-            return f"{file_path}: {lines} lines, {size} bytes"
-
-    # Summary of all files
-    root = Path(".")
-    file_count = 0
-    total_size = 0
-    skip_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
-
-    for root_dir, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in skip_dirs]
-        for file in files:
-            file_count += 1
+        matches = []
+        for path in root.rglob(file_pattern):
+            if any(part in skip for part in path.parts):
+                continue
+            if not path.is_file():
+                continue
             try:
-                total_size += os.path.getsize(os.path.join(root_dir, file))
-            except OSError:
-                pass
-
-    return f"Total files: {file_count}, Total size: {total_size} bytes"
-
-
-@app.tool()
-def edit_line(path: str, line_number: int, new_content: str) -> str:
-    """Edit a specific line in file.
-
-    Args:
-        path: Path to file.
-        line_number: Line number to edit (1-indexed).
-        new_content: New content for the line.
-
-    Returns:
-        Success message.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
-        IndexError: If line number is out of range.
-    """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    if line_number < 1 or line_number > len(lines):
-        raise IndexError(f"Line {line_number} out of range (file has {len(lines)} lines)")
-
-    lines[line_number - 1] = new_content if new_content.endswith("\n") else new_content + "\n"
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-    return f"Line {line_number} edited in {path}"
-
-
-@app.tool()
-def edit_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
-    """Edit lines in range (replace with new content).
-
-    Args:
-        path: Path to file.
-        start_line: Start line number (1-indexed).
-        end_line: End line number (1-indexed, inclusive).
-        new_content: New content to replace the range.
-
-    Returns:
-        Success message.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
-    """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    start_idx = max(0, start_line - 1)
-    end_idx = min(len(lines), end_line)
-
-    # Create new content with proper newlines
-    new_lines = new_content.split("\n")
-    new_lines = [line + "\n" if i < len(new_lines) - 1 else line 
-                 for i, line in enumerate(new_lines)]
-
-    result_lines = lines[:start_idx] + new_lines + lines[end_idx:]
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.writelines(result_lines)
-
-    return f"Lines {start_line}-{end_line} replaced in {path}"
-
-
-@app.tool()
-def insert_lines(path: str, line_number: int, content: str) -> str:
-    """Insert lines at specific position.
-
-    Args:
-        path: Path to file.
-        line_number: Insert before this line (1-indexed).
-        content: Content to insert.
-
-    Returns:
-        Success message.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
-    """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    insert_idx = max(0, min(line_number - 1, len(lines)))
-    new_lines = content.split("\n")
-    new_lines = [line + "\n" if i < len(new_lines) - 1 else line 
-                 for i, line in enumerate(new_lines)]
-
-    result_lines = lines[:insert_idx] + new_lines + lines[insert_idx:]
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.writelines(result_lines)
-
-    return f"Content inserted before line {line_number} in {path}"
-
-
-@app.tool()
-def delete_lines(path: str, start_line: int, end_line: int) -> str:
-    """Delete lines in range.
-
-    Args:
-        path: Path to file.
-        start_line: Start line number (1-indexed).
-        end_line: End line number (1-indexed, inclusive).
-
-    Returns:
-        Success message.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
-    """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    start_idx = max(0, start_line - 1)
-    end_idx = min(len(lines), end_line)
-
-    result_lines = lines[:start_idx] + lines[end_idx:]
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.writelines(result_lines)
-
-    return f"Lines {start_line}-{end_line} deleted from {path}"
-
-
-@app.tool()
-def count_lines(path: str) -> int:
-    """Count total lines in file.
-
-    Args:
-        path: Path to file.
-
-    Returns:
-        Number of lines.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
-    """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        return len(f.readlines())
-
-
-@app.tool()
-def create_project_structure(base_path: str, structure: str) -> str:
-    """Create multiple directories at once for project structure.
-    
-    Args:
-        base_path: Base project directory path.
-        structure: Comma-separated list of subdirectories (e.g., "src,tests,docs,config").
-    
-    Returns:
-        Success message.
-    
-    Example:
-        create_project_structure("myapp", "frontend/src,frontend/public,backend/api,backend/models")
-    """
-    base = Path(base_path)
-    base.mkdir(parents=True, exist_ok=True)
-    
-    dirs = [d.strip() for d in structure.split(",")]
-    created = []
-    
-    for dir_path in dirs:
-        full_path = base / dir_path
-        full_path.mkdir(parents=True, exist_ok=True)
-        created.append(str(full_path))
-    
-    return f"Created {len(created)} directories in {base_path}: {', '.join(dirs)}"
-
-
-@app.tool()
-def get_file_info(path: str) -> str:
-    """Get detailed file information.
-
-    Args:
-        path: Path to file.
-
-    Returns:
-        File information.
-
-    Raises:
-        FileNotFoundError: If file doesn't exist.
-    """
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-
-    stat = file_path.stat()
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = len(f.readlines())
-
-    return f"""File: {path}
-Size: {stat.st_size} bytes
-Lines: {lines}
-Modified: {stat.st_mtime}
-Created: {stat.st_ctime}"""
-
-
-
-@app.prompt()
-def summarize_file(file_path: str) -> str:
-    """Summarize the content and purpose of a file.
-
-    Args:
-        file_path: Path to file to summarize.
-
-    Returns:
-        Prompt for summarization.
-    """
-    try:
-        content = read_file(file_path)
-        return f"""Please summarize the following file '{file_path}':
-
-```
-{content[:2000]}
-```
-
-Provide a brief summary of what this file does and its purpose."""
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                for i, line in enumerate(text.splitlines(), 1):
+                    if pattern.search(line):
+                        matches.append({
+                            "file": str(path.relative_to(root)),
+                            "line": i,
+                            "text": line.strip()[:200],
+                        })
+                        if len(matches) >= max_results:
+                            return _ok({"matches": matches, "count": len(matches), "truncated": True})
+            except Exception:
+                continue
+
+        return _ok({"matches": matches, "count": len(matches), "truncated": False})
     except Exception as e:
-        return f"Error reading file: {e}"
+        return _err(str(e))
 
-
-@app.prompt()
-def explain_file_purpose(file_path: str) -> str:
-    """Explain the purpose and structure of a file.
-
-    Args:
-        file_path: Path to file to explain.
-
-    Returns:
-        Prompt for explanation.
-    """
-    try:
-        content = read_file(file_path)
-        return f"""Analyze the file '{file_path}' and explain:
-1. What is the main purpose of this file?
-2. What are the key components/classes/functions?
-3. How does it fit into the project?
-
-File content:
-```
-{content[:3000]}
-```"""
-    except Exception as e:
-        return f"Error reading file: {e}"
 
 if __name__ == "__main__":
     os.environ["FASTMCP_CLI_MODE"] = "production"
-
     logging.getLogger().setLevel(logging.ERROR)
-
-    app.run(
-        transport="stdio",
-        show_banner=False,
-        log_level="error"
-    )
+    app.run(transport="stdio", show_banner=False, log_level="error")

@@ -1,214 +1,224 @@
-"""Bash MCP server for command execution."""
+"""Execution MCP server — run commands, install packages, manage processes.
+
+Structured JSON responses: {"ok": true/false, "data": ..., "error": ...}
+"""
+
+import json
 import logging
 import os
 import subprocess
-from typing import Dict, Any
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from fastmcp import FastMCP
 
 app = FastMCP(name="bash")
 
 
-def _execute_command(command: str, cwd: str = ".", timeout: int = 60) -> Dict[str, Any]:
-    """Internal helper to execute commands.
-    
-    Args:
-        command: Command to execute.
-        cwd: Working directory.
-        timeout: Command timeout in seconds.
-    
-    Returns:
-        Dictionary with stdout, stderr, exit_code, and success.
-    """
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def _ok(data: Any = None, message: str = "") -> str:
+    return json.dumps({"ok": True, "data": data, "message": message})
+
+
+def _err(error: str) -> str:
+    return json.dumps({"ok": False, "error": error})
+
+
+def _execute(command: str, cwd: str = ".", timeout: int = 120) -> Dict[str, Any]:
+    """Internal command executor. NOT a tool — safe to call from other tools."""
     try:
+        cwd_path = Path(cwd).resolve()
+        if not cwd_path.is_dir():
+            return {"stdout": "", "stderr": f"Directory not found: {cwd}", "exit_code": -1, "success": False}
+
         result = subprocess.run(
             command,
             shell=True,
-            cwd=cwd,
+            cwd=str(cwd_path),
             capture_output=True,
             text=True,
             timeout=timeout,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
-
         return {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "exit_code": result.returncode,
             "success": result.returncode == 0,
         }
-
     except subprocess.TimeoutExpired:
-        return {"error": f"Command timed out after {timeout} seconds", "exit_code": -1, "success": False}
+        return {"stdout": "", "stderr": f"Command timed out after {timeout}s", "exit_code": -1, "success": False}
     except Exception as e:
-        return {"error": str(e), "exit_code": -1, "success": False}
+        return {"stdout": "", "stderr": str(e), "exit_code": -1, "success": False}
+
+
+# ============================================================================
+# COMMAND EXECUTION
+# ============================================================================
+
+@app.tool()
+def run_command(command: str, cwd: str = ".", timeout: int = 120) -> str:
+    """Run a shell command and return structured output.
+
+    Args:
+        command: Shell command to execute.
+        cwd: Working directory (default: current directory).
+        timeout: Timeout in seconds (default: 120).
+
+    Returns:
+        JSON with stdout, stderr, exit_code, success.
+    """
+    result = _execute(command, cwd, timeout)
+    return _ok(result) if result["success"] else _ok(result, f"Command failed with exit code {result['exit_code']}")
 
 
 @app.tool()
-def run_command(command: str, cwd: str = ".") -> str:
-    """Run bash command and return output.
+def run_python(code_or_file: str, cwd: str = ".", args: str = "") -> str:
+    """Run Python code (inline string) or a Python file.
+
+    If code_or_file ends with .py, runs it as a file.
+    Otherwise, executes it as inline code via `python -c`.
 
     Args:
-        command: Command to execute.
+        code_or_file: Python file path or inline code string.
         cwd: Working directory.
+        args: Additional command-line arguments.
 
     Returns:
-        JSON string with stdout, stderr, and exit code.
+        JSON with execution result.
     """
-    result = _execute_command(command, cwd)
-    return str(result)
+    if code_or_file.strip().endswith(".py"):
+        cmd = f"python {code_or_file}"
+    else:
+        # Inline code — use -c flag
+        escaped = code_or_file.replace("'", "'\"'\"'")
+        cmd = f"python -c '{escaped}'"
 
-
-@app.tool()
-def run_python(file_path: str, args: str = "") -> str:
-    """Run Python file and return output.
-
-    Args:
-        file_path: Path to Python file.
-        args: Command line arguments.
-
-    Returns:
-        JSON string with stdout, stderr, and exit code.
-    """
-    command = f"python {file_path}"
     if args:
-        command += f" {args}"
+        cmd += f" {args}"
 
-    result = _execute_command(command)
-    return str(result)
+    result = _execute(cmd, cwd)
+    return _ok(result)
 
 
-@app.tool()
-def install_package(package: str) -> str:
-    """Install Python package using pip.
-
-    Args:
-        package: Package name or requirements.
-
-    Returns:
-        Installation output.
-    """
-    command = f"pip install {package}"
-    result = _execute_command(command)
-    return str(result)
-
+# ============================================================================
+# PACKAGE MANAGEMENT
+# ============================================================================
 
 @app.tool()
-def check_command_exists(command: str) -> bool:
-    """Check if command exists in PATH.
+def pip_install(packages: str, cwd: str = ".") -> str:
+    """Install Python packages via pip.
 
     Args:
-        command: Command name.
-
-    Returns:
-        True if command exists.
-    """
-    result = subprocess.run(
-        f"which {command}",
-        shell=True,
-        capture_output=True,
-    )
-    return result.returncode == 0
-
-
-@app.tool()
-def npm_command(command: str, cwd: str = ".") -> str:
-    """Run npm command.
-    
-    Args:
-        command: npm command (e.g., "install", "start", "run build").
+        packages: Space-separated package names (e.g., "flask sqlalchemy pytest").
         cwd: Working directory.
-    
+
     Returns:
-        Command output.
+        JSON with installation result.
     """
-    full_command = f"npm {command}"
-    result = _execute_command(full_command, cwd=cwd)
-    return str(result)
+    result = _execute(f"pip install {packages}", cwd)
+    return _ok(result, f"pip install {packages}")
 
 
 @app.tool()
-def install_npm_packages(packages: str, cwd: str = ".", dev: bool = False) -> str:
-    """Install npm packages.
-    
+def npm_install(packages: str = "", cwd: str = ".", dev: bool = False) -> str:
+    """Install npm packages. If packages is empty, runs `npm install`.
+
     Args:
-        packages: Space-separated package names (e.g., "react react-dom axios").
+        packages: Space-separated package names (empty = install from package.json).
         cwd: Working directory.
-        dev: Install as dev dependencies.
-    
+        dev: Install as devDependencies.
+
     Returns:
-        Installation output.
+        JSON with installation result.
     """
-    flag = "--save-dev" if dev else ""
-    command = f"npm install {flag} {packages}"
-    result = _execute_command(command, cwd=cwd)
-    return str(result)
-    command = f"npm install {flag} {packages}"
-    return run_command(command, cwd=cwd)
+    if packages.strip():
+        flag = "--save-dev" if dev else ""
+        cmd = f"npm install {flag} {packages}".strip()
+    else:
+        cmd = "npm install"
+
+    result = _execute(cmd, cwd, timeout=180)
+    return _ok(result, cmd)
 
 
 @app.tool()
-def check_node_installed() -> str:
-    """Check if Node.js and npm are installed.
-    
+def npm_run(script: str, cwd: str = ".") -> str:
+    """Run an npm script defined in package.json.
+
+    Args:
+        script: Script name (e.g., "build", "test", "dev").
+        cwd: Working directory.
+
     Returns:
-        Version information or error message.
+        JSON with execution result.
     """
-    node_result = subprocess.run(
-        "node --version",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
-    
-    npm_result = subprocess.run(
-        "npm --version",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
-    
-    if node_result.returncode == 0 and npm_result.returncode == 0:
-        return f"Node: {node_result.stdout.strip()}, npm: {npm_result.stdout.strip()}"
-    return "Node.js/npm not installed"
+    result = _execute(f"npm run {script}", cwd, timeout=180)
+    return _ok(result, f"npm run {script}")
+
+
+# ============================================================================
+# ENVIRONMENT CHECKS
+# ============================================================================
+
+@app.tool()
+def check_tools_available() -> str:
+    """Check which common development tools are available on the system.
+
+    Returns:
+        JSON with availability of python, node, npm, git, docker, cargo, go.
+    """
+    tools = ["python", "python3", "node", "npm", "npx", "git", "docker", "cargo", "go", "java", "make"]
+    available = {}
+
+    for tool in tools:
+        result = subprocess.run(
+            f"which {tool}",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            # Get version
+            version_result = subprocess.run(
+                f"{tool} --version",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            version = version_result.stdout.strip().split("\n")[0] if version_result.returncode == 0 else "installed"
+            available[tool] = version
+        else:
+            available[tool] = None
+
+    return _ok(available)
 
 
 @app.tool()
 def get_system_info() -> str:
-    """Get system information.
+    """Get system information (OS, Python version, working directory).
 
     Returns:
-        System info summary.
+        JSON with system info.
     """
-    info_parts = []
+    import platform
 
-    # Python version
-    py_result = subprocess.run(
-        "python --version",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
-    info_parts.append(f"Python: {py_result.stdout.strip()}")
+    info = {
+        "os": platform.system(),
+        "os_release": platform.release(),
+        "architecture": platform.machine(),
+        "python_version": platform.python_version(),
+        "cwd": os.getcwd(),
+        "home": str(Path.home()),
+    }
 
-    # OS info
-    os_result = subprocess.run(
-        "uname -a",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
-    if os_result.returncode == 0:
-        info_parts.append(f"OS: {os_result.stdout.strip()}")
+    return _ok(info)
 
-    return "\n".join(info_parts)
 
 if __name__ == "__main__":
     os.environ["FASTMCP_CLI_MODE"] = "production"
-
     logging.getLogger().setLevel(logging.ERROR)
-
-    app.run(
-        transport="stdio",
-        show_banner=False,
-        log_level="error"
-    )
+    app.run(transport="stdio", show_banner=False, log_level="error")
