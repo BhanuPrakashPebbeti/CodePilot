@@ -635,8 +635,7 @@ class CodePilotAgent:
             
             # Tool groups — blocking one blocks all in the group
             _TOOL_GROUPS = {
-                "install_runtime": {"install_runtime", "get_install_command"},
-                "get_install_command": {"install_runtime", "get_install_command"},
+                "install_runtime": {"install_runtime"},
             }
             
             async for event in self.agent.astream_events(
@@ -750,8 +749,8 @@ class CodePilotAgent:
                     )
                     
                     if is_error_response:
-                        # Track by tool group — if install_runtime and
-                        # get_install_command both fail, they count together.
+                        # Track by tool group — if related tools in the
+                        # same group both fail, they count together.
                         tool_group = frozenset(_TOOL_GROUPS.get(tool_name, {tool_name}))
                         last_group = frozenset(_TOOL_GROUPS.get(_last_tool_error, {_last_tool_error})) if _last_tool_error else frozenset()
                         

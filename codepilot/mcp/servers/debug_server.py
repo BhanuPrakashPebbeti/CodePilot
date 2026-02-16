@@ -1,7 +1,12 @@
-"""Debug MCP server — error analysis, log reading, process inspection.
+"""Debug MCP server — error analysis and log reading.
 
 Helps the agent diagnose problems when things go wrong: parse error
-messages, read log files, analyze stack traces, and suggest fixes.
+messages, read log files, and extract error patterns from command output.
+
+Tools:
+  parse_error        — Parse an error message/stack trace (Python, Node, Java, Go, generic).
+  read_log_tail      — Read the last N lines of a log file.
+  find_errors_in_output — Scan command output for error patterns.
 """
 
 import json
@@ -183,149 +188,6 @@ def find_errors_in_output(output: str) -> str:
         "errors_found": len(errors),
         "errors": errors[:50],  # Limit output
     })
-
-
-@app.tool()
-def check_port_in_use(port: int) -> str:
-    """Check if a network port is currently in use.
-
-    Args:
-        port: Port number to check.
-
-    Returns:
-        JSON with port status.
-    """
-    try:
-        result = subprocess.run(
-            f"lsof -i :{port} -t",
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode == 0 and result.stdout.strip():
-            pids = result.stdout.strip().split("\n")
-            return _ok({
-                "port": port,
-                "in_use": True,
-                "pids": pids,
-            }, f"Port {port} is in use by PID(s): {', '.join(pids)}")
-        else:
-            return _ok({
-                "port": port,
-                "in_use": False,
-            }, f"Port {port} is available")
-    except Exception as e:
-        return _err(str(e))
-
-
-@app.tool()
-def diagnose_import_error(module_name: str, cwd: str = ".") -> str:
-    """Diagnose why a Python import is failing.
-
-    Checks if the module is installed, finds its location, and
-    suggests fixes.
-
-    Args:
-        module_name: Module name that failed to import.
-        cwd: Working directory.
-
-    Returns:
-        JSON with diagnosis.
-    """
-    diagnosis = {
-        "module": module_name,
-        "installed": False,
-        "location": None,
-        "suggestions": [],
-    }
-
-    # Check if installed
-    try:
-        result = subprocess.run(
-            f"python -c \"import {module_name}; print({module_name}.__file__ if hasattr({module_name}, '__file__') else 'built-in')\"",
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-        )
-
-        if result.returncode == 0:
-            diagnosis["installed"] = True
-            diagnosis["location"] = result.stdout.strip()
-        else:
-            diagnosis["suggestions"].append(f"pip install {module_name}")
-
-            # Check if it's a common package with a different pip name
-            pip_name_map = {
-                "cv2": "opencv-python",
-                "PIL": "Pillow",
-                "sklearn": "scikit-learn",
-                "yaml": "pyyaml",
-                "bs4": "beautifulsoup4",
-                "dotenv": "python-dotenv",
-                "jwt": "pyjwt",
-                "gi": "pygobject",
-                "serial": "pyserial",
-                "usb": "pyusb",
-                "magic": "python-magic",
-            }
-
-            if module_name in pip_name_map:
-                diagnosis["suggestions"] = [f"pip install {pip_name_map[module_name]}"]
-                diagnosis["note"] = f"Module '{module_name}' is installed via '{pip_name_map[module_name]}'"
-
-    except Exception as e:
-        diagnosis["error"] = str(e)
-
-    # Check pip list
-    try:
-        pip_result = subprocess.run(
-            f"pip show {module_name}",
-            shell=True, capture_output=True, text=True, cwd=cwd,
-        )
-        if pip_result.returncode == 0:
-            diagnosis["pip_info"] = pip_result.stdout[:500]
-    except Exception:
-        pass
-
-    return _ok(diagnosis)
-
-
-@app.tool()
-def diff_files(file1: str, file2: str) -> str:
-    """Show differences between two files.
-
-    Args:
-        file1: Path to first file.
-        file2: Path to second file.
-
-    Returns:
-        JSON with diff output.
-    """
-    try:
-        p1 = Path(file1).resolve()
-        p2 = Path(file2).resolve()
-
-        if not p1.exists():
-            return _err(f"File not found: {file1}")
-        if not p2.exists():
-            return _err(f"File not found: {file2}")
-
-        result = subprocess.run(
-            f"diff -u '{p1}' '{p2}'",
-            shell=True, capture_output=True, text=True,
-        )
-
-        if result.returncode == 0:
-            return _ok({"identical": True}, "Files are identical")
-        else:
-            return _ok({
-                "identical": False,
-                "diff": result.stdout[:3000],
-            })
-    except Exception as e:
-        return _err(str(e))
 
 
 if __name__ == "__main__":

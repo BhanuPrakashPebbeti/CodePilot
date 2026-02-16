@@ -1,19 +1,17 @@
-"""Execution MCP server — run commands, install packages, manage processes.
+"""Execution MCP server — run commands and manage background processes.
 
 Structured JSON responses: {"ok": true/false, "data": ..., "error": ...}
 
+Auto-discovers runtimes installed via version managers (nvm, rustup, etc.)
+so that all commands can find node, npm, cargo, etc. without manual PATH setup.
+
 Tools:
-  run_command             — Execute any shell command (blocking). Returns stdout, stderr, exit_code.
-  run_python              — Run Python code (inline string) or a Python .py file.
-  pip_install             — Install Python packages via pip.
-  npm_install             — Install npm packages (or install from package.json).
-  npm_run                 — Run an npm script defined in package.json.
+  run_command              — Execute any shell command (blocking). Returns stdout, stderr, exit_code.
+  run_python               — Run Python code (inline string) or a Python .py file.
   start_background_process — Start a long-running process (server) in the background.
   stop_background_process  — Stop a background process by PID or port.
   wait_for_port            — Wait until a TCP port is accepting connections.
   get_background_output    — Read recent log output from a background process.
-  check_tools_available    — Check which dev tools are installed on the system.
-  get_system_info          — Get OS, Python version, and working directory info.
 """
 
 import json
@@ -51,6 +49,40 @@ def _err(error: str) -> str:
     return json.dumps({"ok": False, "error": error})
 
 
+def _get_env() -> Dict[str, str]:
+    """Get environment with version manager paths (nvm, cargo, etc.) included.
+
+    Ensures commands can find runtimes installed via nvm, rustup, etc.
+    even when they aren't in the default system PATH.
+    """
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+
+    # Add nvm-managed Node.js to PATH
+    nvm_dir = env.get("NVM_DIR", os.path.join(str(Path.home()), ".nvm"))
+    nvm_versions = os.path.join(nvm_dir, "versions", "node")
+    if os.path.isdir(nvm_versions):
+        try:
+            versions = sorted(os.listdir(nvm_versions), reverse=True)
+            if versions:
+                node_bin = os.path.join(nvm_versions, versions[0], "bin")
+                if os.path.isdir(node_bin):
+                    env["PATH"] = node_bin + ":" + env.get("PATH", "")
+        except OSError:
+            pass
+
+    # Add cargo (Rust) to PATH
+    cargo_bin = os.path.join(str(Path.home()), ".cargo", "bin")
+    if os.path.isdir(cargo_bin):
+        env["PATH"] = cargo_bin + ":" + env.get("PATH", "")
+
+    # Add Go binaries to PATH
+    gopath_bin = os.path.join(env.get("GOPATH", os.path.join(str(Path.home()), "go")), "bin")
+    if os.path.isdir(gopath_bin):
+        env["PATH"] = gopath_bin + ":" + env.get("PATH", "")
+
+    return env
+
+
 def _execute(command: str, cwd: str = ".", timeout: int = 120) -> Dict[str, Any]:
     """Internal command executor. NOT a tool — safe to call from other tools.
     
@@ -74,7 +106,7 @@ def _execute(command: str, cwd: str = ".", timeout: int = 120) -> Dict[str, Any]
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            env=_get_env(),
         )
         return {
             "stdout": result.stdout,
@@ -119,7 +151,7 @@ def _execute_with_sudo(command: str, cwd_path: Path, timeout: int = 120) -> Dict
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            env=_get_env(),
         )
 
         stdout, stderr = proc.communicate(input=password + "\n", timeout=timeout)
@@ -197,62 +229,6 @@ def run_python(code_or_file: str, cwd: str = ".", args: str = "") -> str:
 
 
 # ============================================================================
-# PACKAGE MANAGEMENT
-# ============================================================================
-
-@app.tool()
-def pip_install(packages: str, cwd: str = ".") -> str:
-    """Install Python packages via pip.
-
-    Args:
-        packages: Space-separated package names (e.g., "flask sqlalchemy pytest").
-        cwd: Working directory.
-
-    Returns:
-        JSON with installation result.
-    """
-    result = _execute(f"pip install {packages}", cwd)
-    return _ok(result, f"pip install {packages}")
-
-
-@app.tool()
-def npm_install(packages: str = "", cwd: str = ".", dev: bool = False) -> str:
-    """Install npm packages. If packages is empty, runs `npm install`.
-
-    Args:
-        packages: Space-separated package names (empty = install from package.json).
-        cwd: Working directory.
-        dev: Install as devDependencies.
-
-    Returns:
-        JSON with installation result.
-    """
-    if packages.strip():
-        flag = "--save-dev" if dev else ""
-        cmd = f"npm install {flag} {packages}".strip()
-    else:
-        cmd = "npm install"
-
-    result = _execute(cmd, cwd, timeout=180)
-    return _ok(result, cmd)
-
-
-@app.tool()
-def npm_run(script: str, cwd: str = ".") -> str:
-    """Run an npm script defined in package.json.
-
-    Args:
-        script: Script name (e.g., "build", "test", "dev").
-        cwd: Working directory.
-
-    Returns:
-        JSON with execution result.
-    """
-    result = _execute(f"npm run {script}", cwd, timeout=180)
-    return _ok(result, f"npm run {script}")
-
-
-# ============================================================================
 # BACKGROUND PROCESS MANAGEMENT
 # ============================================================================
 
@@ -303,7 +279,7 @@ def start_background_process(
             stderr=subprocess.STDOUT,
             text=True,
             start_new_session=True,  # detach from parent
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            env=_get_env(),
         )
 
         _background_processes[proc.pid] = {
@@ -523,64 +499,6 @@ def _wait_for_port(port: int, timeout: int = 15) -> bool:
         except (ConnectionRefusedError, OSError):
             time.sleep(0.5)
     return False
-
-
-# ============================================================================
-# ENVIRONMENT CHECKS
-# ============================================================================
-
-@app.tool()
-def check_tools_available() -> str:
-    """Check which common development tools are available on the system.
-
-    Returns:
-        JSON with availability of python, node, npm, git, docker, cargo, go.
-    """
-    tools = ["python", "python3", "node", "npm", "npx", "git", "docker", "cargo", "go", "java", "make"]
-    available = {}
-
-    for tool in tools:
-        result = subprocess.run(
-            f"which {tool}",
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            # Get version
-            version_result = subprocess.run(
-                f"{tool} --version",
-                shell=True,
-                capture_output=True,
-                text=True,
-            )
-            version = version_result.stdout.strip().split("\n")[0] if version_result.returncode == 0 else "installed"
-            available[tool] = version
-        else:
-            available[tool] = None
-
-    return _ok(available)
-
-
-@app.tool()
-def get_system_info() -> str:
-    """Get system information (OS, Python version, working directory).
-
-    Returns:
-        JSON with system info.
-    """
-    import platform
-
-    info = {
-        "os": platform.system(),
-        "os_release": platform.release(),
-        "architecture": platform.machine(),
-        "python_version": platform.python_version(),
-        "cwd": os.getcwd(),
-        "home": str(Path.home()),
-    }
-
-    return _ok(info)
 
 
 if __name__ == "__main__":

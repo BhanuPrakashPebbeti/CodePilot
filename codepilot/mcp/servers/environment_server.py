@@ -187,33 +187,6 @@ def check_runtime(name: str, min_version: str = "") -> str:
 
 
 @app.tool()
-def get_install_command(runtime: str = "") -> str:
-    """Get the recommended install command for a missing runtime.
-
-    Args:
-        runtime: REQUIRED — The name of the runtime to install.
-                 Examples: "node", "python3", "go", "rustc", "java", "docker"
-
-    Returns:
-        JSON with OS-appropriate install commands. Does NOT install anything.
-    """
-    runtime = runtime.strip().lower()
-    if not runtime:
-        return _err(
-            "Missing 'runtime' argument. You must specify what to install. "
-            "Example: get_install_command(runtime='node'). "
-            "Or skip this tool and use run_command directly: "
-            "run_command(command='sudo apt-get install -y nodejs npm')"
-        )
-    suggestions = _get_install_suggestions(runtime)
-
-    return _ok(
-        {"runtime": runtime, "suggestions": suggestions},
-        f"Install suggestions for {runtime}"
-    )
-
-
-@app.tool()
 def install_runtime(runtime: str = "", method: str = "") -> str:
     """Attempt to install a runtime. Tries non-sudo methods first.
 
@@ -387,50 +360,6 @@ def create_venv(directory: str = ".", name: str = "venv") -> str:
             f"Virtual environment created: {venv_path}"
         )
     return _err(f"Failed to create venv: {result['stderr']}")
-
-
-@app.tool()
-def check_node_project(directory: str = ".") -> str:
-    """Check if a Node.js project is properly set up in a directory.
-
-    Checks for package.json, node_modules, and lock files.
-    Returns project metadata including scripts and dependency counts.
-
-    Args:
-        directory: Directory to check (default: current directory).
-
-    Returns:
-        JSON with has_package_json, has_node_modules, has_lock_file,
-        name, scripts, dependencies_count, dev_dependencies_count.
-    """
-    root = Path(directory).resolve()
-    status = {
-        "has_package_json": (root / "package.json").exists(),
-        "has_node_modules": (root / "node_modules").is_dir(),
-        "has_lock_file": any(
-            (root / f).exists()
-            for f in ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb"]
-        ),
-    }
-
-    if status["has_package_json"]:
-        try:
-            pkg = json.loads((root / "package.json").read_text())
-            status["name"] = pkg.get("name", "")
-            status["scripts"] = list(pkg.get("scripts", {}).keys())
-            status["dependencies_count"] = len(pkg.get("dependencies", {}))
-            status["dev_dependencies_count"] = len(pkg.get("devDependencies", {}))
-        except Exception:
-            pass
-
-    all_ok = status["has_package_json"] and status["has_node_modules"]
-    msg = "Node.js project OK" if all_ok else "Node.js project needs setup"
-    if not status["has_package_json"]:
-        msg = "No package.json found — run 'npm init -y'"
-    elif not status["has_node_modules"]:
-        msg = "Dependencies not installed — run 'npm install'"
-
-    return _ok(status, msg)
 
 
 # ============================================================================

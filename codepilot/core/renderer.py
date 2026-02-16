@@ -92,12 +92,9 @@ class PhaseTracker:
 TOOL_LABELS = {
     # File writes
     "write_file":        "Write",
-    "create_file":       "Create",
     "append_file":       "Append",
     "edit_lines":        "Edit",
     "edit_line":         "Edit",
-    "insert_lines":      "Insert",
-    "delete_lines":      "Delete",
     "replace_in_file":   "Replace",
     "copy_file":         "Copy",
     "move_file":         "Move",
@@ -106,19 +103,12 @@ TOOL_LABELS = {
     "read_file":         "Read",
     "read_lines":        "Read",
     "file_exists":       "Check",
-    "get_file_info":     "Inspect",
     # Directories
     "create_directory":         "Create dir",
-    "create_project_structure": "Scaffold",
     "list_directory":           "List",
     # Bash
     "run_command":         "Run",
     "run_python":          "Python",
-    "pip_install":         "pip install",
-    "npm_install":         "npm install",
-    "npm_run":             "npm run",
-    "check_tools_available": "Check tools",
-    "get_system_info":     "System info",
     # Background process management
     "start_background_process": "Start server",
     "stop_background_process":  "Stop server",
@@ -131,25 +121,18 @@ TOOL_LABELS = {
     "get_file_overview":   "Overview",
     "read_dependencies":   "Dependencies",
     "search_codebase":     "Search",
-    "search_in_files":     "Search",
-    # Test
-    "run_pytest":          "pytest",
-    "run_npm_test":        "npm test",
+    # Test & Verification
+    "run_tests":           "Run tests",
     "run_single_test":     "Test",
-    "check_python_syntax": "Syntax check",
+    "check_syntax":        "Syntax check",
     "check_json_syntax":   "JSON check",
-    "lint_python":         "Lint",
-    "verify_server_starts":"Verify server",
-    "assert_file_exists":  "Assert exists",
-    "assert_file_contains":"Assert contains",
-    "assert_command_succeeds": "Assert cmd",
+    "lint_code":           "Lint",
+    "http_request":        "HTTP request",
+    "verify_output":       "Verify output",
     # Debug
     "parse_error":           "Parse error",
     "find_errors_in_output": "Find errors",
-    "diagnose_import_error": "Diagnose import",
     "read_log_tail":         "Read log",
-    "check_port_in_use":     "Check port",
-    "diff_files":            "Diff",
     # Git
     "git_init":          "git init",
     "git_status":        "git status",
@@ -172,19 +155,12 @@ TOOL_LABELS = {
     "add_task":          "Add task",
     "replan":            "Replan",
     "get_plan_status":   "Status",
-    "list_tasks":        "Tasks",
-    "clear_tasks":       "Clear",
-    "update_task":       "Update task",
-    "get_next_task":     "Next task",
-    "get_progress_status":"Progress",
     # Environment
     "detect_runtimes":     "Detect runtimes",
     "check_runtime":       "Check runtime",
-    "get_install_command": "Install cmd",
     "install_runtime":     "Install runtime",
     "check_venv":          "Check venv",
     "create_venv":         "Create venv",
-    "check_node_project":  "Check Node.js",
     # GitHub
     "create_repo":         "Create repo",
     "push_to_github":      "Push",
@@ -195,34 +171,26 @@ TOOL_LABELS = {
 }
 
 # Tool categories for icon selection
-_FILE_WRITE  = {"write_file","create_file","append_file","edit_lines","edit_line",
-                "insert_lines","delete_lines","replace_in_file","copy_file",
-                "move_file","delete_file"}
-_FILE_READ   = {"read_file","read_lines","file_exists",
-                "get_file_info"}
-_DIR         = {"create_directory","create_project_structure","list_directory"}
-_BASH        = {"run_command","run_python","pip_install","npm_install",
-                "npm_run","check_tools_available","get_system_info",
+_FILE_WRITE  = {"write_file","append_file","edit_lines","edit_line",
+                "replace_in_file","copy_file","move_file","delete_file"}
+_FILE_READ   = {"read_file","read_lines","file_exists"}
+_DIR         = {"create_directory","list_directory"}
+_BASH        = {"run_command","run_python",
                 "start_background_process","stop_background_process",
                 "wait_for_port","get_background_output"}
-_TEST        = {"run_pytest","run_npm_test","run_single_test",
-                "check_python_syntax","check_json_syntax","lint_python",
-                "verify_server_starts","assert_file_exists",
-                "assert_file_contains","assert_command_succeeds"}
-_DEBUG       = {"parse_error","find_errors_in_output","diagnose_import_error",
-                "read_log_tail","check_port_in_use","diff_files"}
+_TEST        = {"run_tests","run_single_test","check_syntax",
+                "check_json_syntax","lint_code","http_request",
+                "verify_output"}
+_DEBUG       = {"parse_error","find_errors_in_output","read_log_tail"}
 _GIT         = {"git_init","git_status","git_add","git_commit","git_commit_all",
                 "git_log","git_diff","git_branch","git_create_branch",
                 "git_checkout","git_info"}
 _WORKSPACE   = {"detect_project","get_project_tree","find_files",
-                "get_file_overview","read_dependencies","search_codebase",
-                "search_in_files"}
+                "get_file_overview","read_dependencies","search_codebase"}
 _TASK        = {"create_plan","get_current_task","start_task","complete_task",
-                "fail_task","skip_task","add_task","replan","get_plan_status",
-                "list_tasks","clear_tasks","update_task","get_next_task",
-                "get_progress_status"}
-_ENVIRONMENT = {"detect_runtimes","check_runtime","get_install_command",
-                "install_runtime","check_venv","create_venv","check_node_project"}
+                "fail_task","skip_task","add_task","replan","get_plan_status"}
+_ENVIRONMENT = {"detect_runtimes","check_runtime",
+                "install_runtime","check_venv","create_venv"}
 _GITHUB      = {"create_repo","push_to_github","open_pull_request",
                 "get_repo_info","list_pull_requests","get_github_user"}
 
@@ -501,15 +469,15 @@ class Renderer:
             return ""
 
         # File write: path + line count
-        if tool_name in ("write_file", "create_file"):
+        if tool_name == "write_file":
             path = args.get("path", "")
             content = args.get("content", "")
             n = content.count("\n") + 1 if content else 0
             return f"[cyan]{escape(path)}[/cyan] [dim]({n} lines)[/dim]"
 
-        # File read: path
-        if tool_name in ("read_file", "get_file_overview", "get_file_info",
-                         "check_python_syntax", "check_json_syntax", "lint_python",
+        # File read / syntax / lint: path
+        if tool_name in ("read_file", "get_file_overview",
+                         "check_syntax", "check_json_syntax", "lint_code",
                          "file_exists", "file_summary", "count_lines"):
             path = args.get("path") or args.get("file_path", "")
             return f"[cyan]{escape(path)}[/cyan]"
@@ -526,19 +494,14 @@ class Renderer:
             search = (args.get("search", "") or "")[:40]
             return f"[cyan]{escape(path)}[/cyan] [dim]\"{escape(search)}…\"[/dim]"
 
-        # Edit/insert/delete lines
-        if tool_name in ("edit_lines", "insert_lines", "delete_lines", "edit_line"):
+        # Edit lines
+        if tool_name in ("edit_lines", "edit_line"):
             path = args.get("path", "")
             return f"[cyan]{escape(path)}[/cyan]"
 
         # Directories
         if tool_name == "create_directory":
             return f"[cyan]{escape(args.get('path', ''))}[/cyan]"
-        if tool_name == "create_project_structure":
-            base = args.get("base_path", "")
-            structure = args.get("structure", "")
-            dirs = [d.strip() for d in structure.split(",")][:5]
-            return f"[cyan]{escape(base)}/[/cyan] [dim]({', '.join(dirs)}{'…' if len(structure.split(',')) > 5 else ''})[/dim]"
         if tool_name in ("list_directory", "list_dir"):
             return f"[cyan]{escape(args.get('path', '.'))}[/cyan]"
 
@@ -553,34 +516,26 @@ class Renderer:
             if "\n" in code or len(code) > 60:
                 return "[yellow]$ python <inline>[/yellow]"
             return f"[yellow]$ python {escape(code)}[/yellow]"
-        if tool_name == "pip_install":
-            return f"[yellow]{escape(args.get('packages', ''))}[/yellow]"
-        if tool_name == "npm_install":
-            pkgs = args.get("packages", "")
-            cwd = args.get("cwd", "")
-            dev = " [dim]--save-dev[/dim]" if args.get("dev") else ""
-            loc = f" [dim](in {escape(cwd)})[/dim]" if cwd and cwd != "." else ""
-            return f"[yellow]{escape(pkgs)}{dev}[/yellow]{loc}"
-        if tool_name == "npm_run":
-            script = args.get("script", "")
-            cwd = args.get("cwd", "")
-            loc = f" [dim](in {escape(cwd)})[/dim]" if cwd and cwd != "." else ""
-            return f"[yellow]{escape(script)}[/yellow]{loc}"
 
-        # Test
-        if tool_name == "run_pytest":
+        # Test & Verification
+        if tool_name == "run_tests":
             d = args.get("directory", ".")
             return f"[dim]{escape(d)}[/dim]"
-        if tool_name == "verify_server_starts":
+        if tool_name == "run_single_test":
+            f = args.get("test_file", "")
+            return f"[cyan]{escape(f)}[/cyan]"
+        if tool_name == "http_request":
+            method = args.get("method", "GET")
+            url = args.get("url", "")
+            return f"[yellow]{escape(method)} {escape(url)}[/yellow]"
+        if tool_name == "verify_output":
             cmd = args.get("command", "")
             return f"[yellow]$ {escape(cmd)}[/yellow]"
-        if tool_name == "assert_file_exists":
-            return f"[dim]{escape(args.get('paths', ''))}[/dim]"
 
         # Workspace
         if tool_name in ("detect_project", "get_project_tree"):
             return f"[dim]{escape(args.get('directory', '.'))}[/dim]"
-        if tool_name in ("search_codebase", "search_in_files"):
+        if tool_name == "search_codebase":
             return f"[dim]\"{escape(args.get('query', ''))}\"[/dim]"
         if tool_name == "find_files":
             return f"[dim]{escape(args.get('pattern', '*'))}[/dim]"
@@ -595,8 +550,6 @@ class Renderer:
         if tool_name == "parse_error":
             text = (args.get("error_text", "") or "")[:60]
             return f"[dim]\"{escape(text)}…\"[/dim]"
-        if tool_name == "diagnose_import_error":
-            return f"[dim]{escape(args.get('module_name', ''))}[/dim]"
 
         # Tasks
         if tool_name == "create_plan":
