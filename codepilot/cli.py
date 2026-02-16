@@ -10,7 +10,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .config import ConfigManager
-from .core import CodePilotError, ConfigurationError, create_agent
+from .core import CodePilotError, ConfigurationError, create_codepilot_agent
 from .core.session import SessionManager
 from .utils import console, enable_debug_mode, get_logger
 from .utils.constants import (
@@ -213,7 +213,7 @@ def run_command(
         console.print(f"[dim]Provider: {provider} | Model: {model}[/dim]\n")
         
         # Create agent
-        agent = create_agent(config_manager, project)
+        agent = create_codepilot_agent(config_manager, project)
         
         # Execute task or start interactive
         if task:

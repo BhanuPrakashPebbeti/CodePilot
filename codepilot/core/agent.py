@@ -19,9 +19,9 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent, ToolNode
+from langgraph.prebuilt import ToolNode, create_react_agent
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -29,6 +29,10 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 
 from .exceptions import ConfigurationError, LLMError, MCPError
+from .memory import (
+    MemoryManager, MemoryConfig, TruncationConfig, 
+    SmartMemoryManager, truncate_tool_output, estimate_tokens
+)
 from .permissions import PermissionGate, PermissionLevel
 from .renderer import Renderer, console
 from .session import SessionManager
@@ -331,7 +335,31 @@ class CodePilotAgent:
         self.renderer = Renderer()
         self.permissions = PermissionGate()
         
+        # Smart memory management with LLM summarization
+        # Uses intelligent summarization instead of simple truncation
+        self.memory: SmartMemoryManager = SmartMemoryManager(
+            config=MemoryConfig(
+                max_context_tokens=100000,  # Leave headroom from 131k limit
+                target_context_tokens=80000,
+                enable_summarization=True,  # Use LLM for smart summarization
+                summary_threshold=15,       # Summarize after 15 messages
+                tool_output_summary_threshold=2000,  # Summarize tool outputs > 2000 tokens
+                max_tool_output_tokens=1500,  # Target token count for summarized outputs
+                truncation=TruncationConfig(
+                    max_tool_output_tokens=8000,
+                    max_tool_output_lines=200,
+                    preserve_head_lines=50,
+                    preserve_tail_lines=50,
+                ),
+            ),
+            llm=None,  # Will be set after LLM initialization
+        )
+        
         self._initialize_llm()
+        
+        # Now set the LLM for summarization
+        if self.llm_provider:
+            self.memory.set_llm(self.llm_provider.get_llm())
     
     # ========================================================================
     # INITIALIZATION
@@ -555,9 +583,44 @@ class CodePilotAgent:
             # so old plans from previous runs don't interfere.
             if len(self.messages) == 0:
                 self._clear_plan_state()
+                self.memory.clear_cache()  # Clear token cache for fresh start
             
             user_message = HumanMessage(content=task)
             self.messages.append(user_message)
+            
+            # Smart memory management: use LLM summarization when available
+            if self.memory.should_prune(self.messages):
+                stats_before = self.memory.get_stats(self.messages)
+                
+                # Use smart compression with LLM summarization
+                try:
+                    self.messages = await self.memory.compress_messages_async(self.messages)
+                    compression_method = "summarized" if self.memory.llm else "pruned"
+                except Exception as e:
+                    logger.warning(f"Smart compression failed, falling back to pruning: {e}")
+                    self.messages = self.memory.prune_messages(self.messages)
+                    compression_method = "pruned"
+                
+                stats_after = self.memory.get_stats(self.messages)
+                logger.info(
+                    f"Memory {compression_method}: {stats_before['total_tokens']} -> "
+                    f"{stats_after['total_tokens']} tokens"
+                )
+                
+                # Show user-friendly message about what happened
+                tokens_saved = stats_before['total_tokens'] - stats_after['total_tokens']
+                if compression_method == "summarized":
+                    console.print(
+                        f"  [dim]📝 Context summarized: {stats_before['message_count']} → "
+                        f"{stats_after['message_count']} messages "
+                        f"(saved ~{tokens_saved:,} tokens)[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"  [dim]📝 Memory optimized: {stats_before['message_count']} → "
+                        f"{stats_after['message_count']} messages "
+                        f"({stats_after['usage_percent']:.0f}% context)[/dim]"
+                    )
             
             self.renderer.reset()
             final_ai_content = ""
@@ -647,6 +710,27 @@ class CodePilotAgent:
                     tool_name = event.get("name", "unknown")
                     output = event.get("data", {}).get("output", "")
                     output_str = _extract_tool_output(output)
+                    
+                    # Smart memory management: summarize large tool outputs
+                    # instead of simple truncation to preserve key information
+                    original_tokens = estimate_tokens(output_str)
+                    
+                    if original_tokens > self.memory.config.tool_output_summary_threshold:
+                        try:
+                            # Try async summarization
+                            output_str = await self.memory.prepare_tool_output_async(
+                                tool_name, output_str
+                            )
+                            new_tokens = estimate_tokens(output_str)
+                            if new_tokens < original_tokens:
+                                logger.info(
+                                    f"Summarized {tool_name} output: "
+                                    f"{original_tokens} -> {new_tokens} tokens"
+                                )
+                        except Exception as e:
+                            # Fall back to simple truncation
+                            logger.debug(f"Summarization failed for {tool_name}: {e}")
+                            output_str = self.memory.prepare_tool_output(output_str, tool_name)
                     
                     # Silently discard results from blocked tools — LangGraph
                     # already ran the tool (we can't prevent it), but we skip
@@ -750,7 +834,7 @@ class CodePilotAgent:
         """Interactive REPL session."""
         self._ensure_initialized()
         
-        console.print("\n[dim]Type your request, 'quit' to exit, 'clear' to reset[/dim]\n")
+        console.print("\n[dim]Type your request, 'quit' to exit, 'clear' to reset, 'memory' for stats[/dim]\n")
         
         while True:
             try:
@@ -765,7 +849,12 @@ class CodePilotAgent:
                 
                 if user_input.lower() == "clear":
                     self.messages = []
-                    console.print("[dim]History cleared[/dim]")
+                    self.memory.clear_cache()
+                    console.print("[dim]History and memory cache cleared[/dim]")
+                    continue
+                
+                if user_input.lower() in ("memory", "stats"):
+                    self._show_memory_stats()
                     continue
                 
                 if user_input.lower() == "history":
@@ -793,13 +882,48 @@ class CodePilotAgent:
         console.print("""
 [bold]Commands:[/bold]
   quit, exit, q  — Exit session
-  clear          — Clear conversation history
+  clear          — Clear conversation history and memory cache
   history        — Show message history
+  memory, stats  — Show memory usage statistics
   tools          — List available tools
   help           — Show this help
 
 Or type any task to execute.
 """)
+    
+    def _show_memory_stats(self) -> None:
+        """Display memory usage statistics."""
+        stats = self.memory.get_stats(self.messages)
+        
+        console.print("\n[bold]Memory Statistics:[/bold]")
+        console.print(f"  Total tokens:  {stats['total_tokens']:,} / {stats['max_tokens']:,}")
+        console.print(f"  Usage:         {stats['usage_percent']:.1f}%")
+        console.print(f"  Messages:      {stats['message_count']}")
+        
+        console.print(f"\n[bold]Tokens by type:[/bold]")
+        console.print(f"  Human:   {stats['tokens_by_type']['human']:,}")
+        console.print(f"  AI:      {stats['tokens_by_type']['ai']:,}")
+        console.print(f"  Tool:    {stats['tokens_by_type']['tool']:,}")
+        
+        # Smart memory stats
+        console.print(f"\n[bold]Smart Memory:[/bold]")
+        console.print(f"  Summarization:     {'✓ Enabled' if stats.get('summarization_enabled') else '✗ Disabled'}")
+        console.print(f"  LLM available:     {'✓ Yes' if stats.get('llm_available') else '✗ No'}")
+        
+        if stats.get('archived_summaries', 0) > 0:
+            console.print(f"  Archived summaries: {stats['archived_summaries']}")
+        if stats.get('tool_summaries_cached', 0) > 0:
+            console.print(f"  Tool summaries:     {stats['tool_summaries_cached']} cached")
+        if stats.get('rolling_summary_tokens', 0) > 0:
+            console.print(f"  Rolling summary:    {stats['rolling_summary_tokens']:,} tokens")
+        if stats.get('tokens_saved_by_summarization', 0) > 0:
+            console.print(f"  [green]Tokens saved:       {stats['tokens_saved_by_summarization']:,}[/green]")
+        
+        if stats['largest_messages']:
+            console.print(f"\n[bold]Largest messages:[/bold]")
+            for msg_type, tokens in stats['largest_messages'][:5]:
+                console.print(f"  {msg_type}: {tokens:,} tokens")
+        console.print()
     
     def _show_history(self) -> None:
         if not self.messages:
@@ -828,12 +952,12 @@ Or type any task to execute.
         console.print()
 
 
-def create_agent(
+def create_codepilot_agent(
     config_manager: ConfigManager,
     project_dir: str = ".",
     session_manager: Optional[SessionManager] = None,
 ) -> CodePilotAgent:
-    """Factory function to create agent."""
+    """Factory function to create CodePilot agent."""
     return CodePilotAgent(
         config_manager=config_manager,
         project_dir=project_dir,
