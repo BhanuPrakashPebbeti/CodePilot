@@ -284,10 +284,13 @@ def list_directory(path: str = ".") -> str:
 
 @app.tool()
 def delete_file(path: str) -> str:
-    """Delete a file.
+    """Delete a file or directory.
+
+    Automatically detects whether the path is a file or directory
+    and removes it accordingly. Directories are removed recursively.
 
     Args:
-        path: Path to file.
+        path: Path to file or directory.
 
     Returns:
         JSON with result.
@@ -295,9 +298,10 @@ def delete_file(path: str) -> str:
     try:
         fp = _resolve(path)
         if not fp.exists():
-            return _err(f"File not found: {path}")
+            return _err(f"Path not found: {path}")
         if fp.is_dir():
-            return _err(f"Path is a directory: {path}")
+            shutil.rmtree(fp)
+            return _ok({"path": str(fp)}, f"Directory deleted: {path}")
         fp.unlink()
         return _ok({"path": str(fp)}, f"File deleted: {path}")
     except Exception as e:

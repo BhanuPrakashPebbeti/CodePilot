@@ -142,6 +142,7 @@ Work through tasks one at a time, strictly in order:
 - Mark each task as completed only after the work is done and you have initial confidence it's correct.
 - If a task fails, mark it failed with a clear error description. Then either fix and retry, or replan.
 - Never mark a task complete twice. Never skip the start/complete tracking.
+- CRITICAL: After completing each task, you MUST immediately call get_current_task() to get the next pending task and continue working. NEVER stop or generate a final text response until ALL plan tasks are marked done. Stopping after only some tasks are complete is a critical failure.
 
 ### 2.4 VERIFY
 After all tasks are complete, prove the system works:
@@ -165,6 +166,7 @@ If verification reveals problems:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 You are NOT done when:
+- You have completed only some tasks in the plan. ALL tasks must be done.
 - You have written all the files.
 - You have installed dependencies.
 - You believe the code is correct.
@@ -529,6 +531,31 @@ class CodePilotAgent:
             except Exception:
                 pass  # Best-effort cleanup
     
+    @staticmethod
+    def _get_plan_remaining_count() -> int:
+        """Check how many plan tasks are still pending or in-progress.
+        
+        Reads the planning server's shared state file directly to determine
+        if the agent stopped prematurely before completing all planned tasks.
+        
+        Returns:
+            Number of tasks still pending or in-progress. 0 if no plan exists.
+        """
+        import tempfile
+        state_file = os.path.join(tempfile.gettempdir(), "codepilot_plan_state.json")
+        try:
+            if os.path.exists(state_file):
+                with open(state_file, "r") as f:
+                    plan_data = json.load(f)
+                tasks = plan_data.get("tasks", [])
+                return sum(
+                    1 for t in tasks
+                    if t.get("status") in ("pending", "in_progress")
+                )
+        except Exception:
+            pass
+        return 0
+    
     # ========================================================================
     # EXECUTION — Single path, no double-run
     # ========================================================================
@@ -554,6 +581,27 @@ class CodePilotAgent:
             self.session_manager._save()
             
             result = asyncio.run(self._execute_task(task))
+            
+            # Auto-continuation: if the LLM stopped but the plan has
+            # remaining tasks, re-invoke with a continuation prompt.
+            # This handles weaker/free models that stop prematurely
+            # after completing only one or a few tasks.
+            _MAX_AUTO_CONTINUATIONS = 50
+            for _cont_i in range(_MAX_AUTO_CONTINUATIONS):
+                remaining = self._get_plan_remaining_count()
+                if remaining <= 0:
+                    break
+                
+                console.print(
+                    f"\n  [dim cyan]↻ Plan has {remaining} pending task(s) — "
+                    f"auto-continuing...[/dim cyan]\n"
+                )
+                continuation_prompt = (
+                    f"You have {remaining} tasks remaining in your plan that are not yet done. "
+                    f"Do NOT stop. Call get_current_task() to find the next pending task, "
+                    f"then execute it completely. Keep working until every task is done."
+                )
+                result = asyncio.run(self._execute_task(continuation_prompt))
             
             session_task.status = "completed"
             session_task.completed_at = __import__('datetime').datetime.now()
