@@ -2,11 +2,14 @@
 
 import logging
 import os
+import subprocess
 from typing import Optional
 
 import requests
 
 from fastmcp import FastMCP
+
+from codepilot.mcp.servers._env import get_clean_env
 
 app = FastMCP(name="github")
 
@@ -107,10 +110,14 @@ def push_branch(repo: str, branch: str = "main") -> str:
     # Note: This requires git to be configured with GitHub credentials
     try:
         owner, repo_name = _parse_repo_url(repo)
-        result = os.system(f"git push origin {branch}")
-        if result == 0:
+        result = subprocess.run(
+            f"git push origin {branch}",
+            shell=True, capture_output=True, text=True, timeout=60,
+            env=get_clean_env(),
+        )
+        if result.returncode == 0:
             return f"Pushed {branch} to {owner}/{repo_name}"
-        return "Error pushing branch (check git configuration)"
+        return f"Error pushing branch: {result.stderr.strip() or 'check git configuration'}"
     except Exception as e:
         return f"Error: {str(e)}"
 

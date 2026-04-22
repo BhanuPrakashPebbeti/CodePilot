@@ -1,28 +1,19 @@
-"""Package marker for core module."""
+"""Package marker for core module.
 
-from .agent import CodePilotAgent, create_codepilot_agent
+Shared utilities used by both the new ADK agents and legacy code.
+The legacy CodePilotAgent (LangGraph) lives in agent.py but is NOT
+imported here to avoid circular imports.
+"""
+
 from .exceptions import CodePilotError, ConfigurationError, LLMError, SessionError
-from .memory import MemoryManager, MemoryConfig, TruncationConfig, SmartMemoryManager
-from .summarizer import Summarizer, ConversationCompressor
-from .permissions import PermissionGate, PermissionLevel
 from .renderer import Renderer
 from .session import SessionManager
 
 __all__ = [
-    "CodePilotAgent",
-    "create_codepilot_agent",
     "CodePilotError",
     "ConfigurationError",
     "LLMError",
     "SessionError",
-    "MemoryManager",
-    "MemoryConfig",
-    "TruncationConfig",
-    "SmartMemoryManager",
-    "Summarizer",
-    "ConversationCompressor",
-    "PermissionGate",
-    "PermissionLevel",
     "Renderer",
     "SessionManager",
 ]

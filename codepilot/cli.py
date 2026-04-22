@@ -10,7 +10,8 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .config import ConfigManager
-from .core import CodePilotError, ConfigurationError, create_codepilot_agent
+from .agents import create_codepilot_runner, CodePilotRunner
+from .core.exceptions import CodePilotError, ConfigurationError
 from .core.session import SessionManager
 from .utils import console, enable_debug_mode, get_logger
 from .utils.constants import (
@@ -213,16 +214,16 @@ def run_command(
         console.print(f"[dim]Provider: {provider} | Model: {model}[/dim]\n")
         
         # Create agent
-        agent = create_codepilot_agent(config_manager, project)
+        runner = create_codepilot_runner(config_manager, project)
         
         # Execute task or start interactive
         if task:
             console.print(f"\n[cyan]Executing:[/cyan] {task}\n")
-            agent.run(task)
+            runner.run(task)
             console.print("\n[green]✅ Done[/green]")
         else:
             console.print("\n[dim]Type 'exit' or 'quit' to end session[/dim]\n")
-            agent.run_interactive()
+            runner.run_interactive()
     
     except ConfigurationError as e:
         console.print(f"[red]Configuration error:[/red] {e}")

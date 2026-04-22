@@ -34,8 +34,20 @@ def _err(error: str) -> str:
 
 
 def _resolve(path: str) -> Path:
-    """Resolve path (supports relative and absolute)."""
-    return Path(path).resolve()
+    """Resolve path — relative paths use CODEPILOT_PROJECT_DIR as base.
+
+    When the MCP server is spawned with cwd=project_dir, Path.resolve()
+    would work on its own.  This is a belt-and-suspenders check: if for
+    any reason the subprocess CWD doesn't match, we still resolve against
+    the correct project directory.
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return p.resolve()
+    project_dir = os.environ.get("CODEPILOT_PROJECT_DIR")
+    if project_dir:
+        return (Path(project_dir) / p).resolve()
+    return p.resolve()
 
 
 # ============================================================================
@@ -109,14 +121,21 @@ def read_lines(path: str, start: int, end: int) -> str:
 
 @app.tool()
 def write_file(path: str, content: str) -> str:
-    """Write content to file (creates parent dirs, overwrites if exists).
+    """Write COMPLETE content to a file in a single call.
+
+    Creates parent directories automatically. Overwrites if the file
+    already exists. This is the PREFERRED tool for creating new files.
+
+    IMPORTANT: Always provide the FULL file content — all imports, all
+    function bodies, all configurations. Do NOT call this multiple times
+    on the same file. One call per file.
 
     Args:
-        path: Path to file.
-        content: Full file content.
+        path: File path (relative to project root or absolute).
+        content: The COMPLETE file content to write.
 
     Returns:
-        JSON with result.
+        JSON with written file path, line count, and size.
     """
     try:
         fp = _resolve(path)
@@ -158,15 +177,19 @@ def append_file(path: str, content: str) -> str:
 
 @app.tool()
 def replace_in_file(path: str, search: str, replace: str) -> str:
-    """Find and replace text in file. Returns count of replacements.
+    """Find and replace exact text in an existing file.
+
+    Use this for targeted edits to existing files. Provide the EXACT text
+    to search for (including whitespace/indentation) and the replacement.
+    Preferred over edit_lines for small, precise changes.
 
     Args:
-        path: Path to file.
-        search: Exact text to find.
-        replace: Text to replace with.
+        path: Path to the file to edit.
+        search: Exact text to find (must match character-for-character).
+        replace: Text to replace all occurrences with.
 
     Returns:
-        JSON with replacement count.
+        JSON with the number of replacements made.
     """
     try:
         fp = _resolve(path)
@@ -192,16 +215,21 @@ def replace_in_file(path: str, search: str, replace: str) -> str:
 
 @app.tool()
 def edit_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
-    """Replace a range of lines with new content.
+    """Replace a BLOCK of lines (5+ lines) in an existing file.
+
+    Use this ONLY when you need to replace a large contiguous block of code.
+    For new files, use write_file instead. For small text replacements, use
+    replace_in_file instead. Do NOT call this repeatedly on the same file
+    with different line ranges — write the complete file with write_file.
 
     Args:
-        path: Path to file.
+        path: Path to file (must already exist).
         start_line: First line to replace (1-indexed).
         end_line: Last line to replace (1-indexed, inclusive).
-        new_content: New content to insert in place of the range.
+        new_content: New content to insert in place of the line range.
 
     Returns:
-        JSON with result.
+        JSON with lines replaced count and new total lines.
     """
     try:
         fp = _resolve(path)
@@ -366,6 +394,63 @@ def file_exists(path: str) -> str:
     """
     fp = _resolve(path)
     return _ok({"path": str(fp), "exists": fp.exists(), "is_file": fp.is_file(), "is_dir": fp.is_dir()})
+
+
+@app.tool()
+def search_in_file(path: str, pattern: str, is_regex: bool = False) -> str:
+    """Search for text or regex pattern within a file.
+
+    Returns matching lines with line numbers. Use this instead of running
+    `grep` via run_command — it's faster and more reliable.
+
+    Args:
+        path: Path to the file to search in.
+        pattern: Text or regex pattern to search for.
+        is_regex: If True, treat `pattern` as a regular expression.
+                  If False (default), do exact substring matching.
+
+    Returns:
+        JSON with list of matching lines and their line numbers.
+    """
+    try:
+        fp = _resolve(path)
+        if not fp.exists():
+            return _err(f"File not found: {path}")
+        if fp.is_dir():
+            return _err(f"Path is a directory: {path}")
+
+        content = fp.read_text(encoding="utf-8", errors="replace")
+        lines = content.splitlines()
+        matches = []
+
+        if is_regex:
+            try:
+                compiled = re.compile(pattern)
+            except re.error as e:
+                return _err(f"Invalid regex: {e}")
+            for i, line in enumerate(lines, 1):
+                if compiled.search(line):
+                    matches.append({"line": i, "content": line})
+        else:
+            for i, line in enumerate(lines, 1):
+                if pattern in line:
+                    matches.append({"line": i, "content": line})
+
+        # Cap results to prevent huge outputs
+        total_matches = len(matches)
+        if total_matches > 100:
+            matches = matches[:100]
+
+        return _ok({
+            "path": str(fp),
+            "pattern": pattern,
+            "is_regex": is_regex,
+            "total_matches": total_matches,
+            "matches": matches,
+            "truncated": total_matches > 100,
+        }, f"Found {total_matches} match(es) in {path}")
+    except Exception as e:
+        return _err(str(e))
 
 
 if __name__ == "__main__":

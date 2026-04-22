@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codepilot"
-version = "1.0.0"
-description = "Production-ready autonomous AI coding assistant powered by LLMs and MCP servers"
+version = "2.0.0"
+description = "Autonomous AI coding assistant powered by Google ADK multi-agent architecture and MCP servers"
 authors = [{name = "Bhanu Prakash"}]
 license = {text = "MIT"}
 readme = "README.md"
@@ -28,13 +28,17 @@ dependencies = [
     "typer>=0.9.0",
     "rich>=13.0",
     "pydantic>=2.0",
-    "langchain-core>=0.2.0",
-    "langchain-openai>=0.1.0",
-    "langchain-ollama>=0.1.0",
-    "langchain-mcp-adapters>=0.1.0",
-    "langgraph>=0.2.0",
+    # ADK multi-agent framework
+    "google-adk>=1.0.0",
+    "google-genai>=1.0.0",
+    "mcp>=1.0.0",
+    # FastMCP for existing MCP servers
     "fastmcp>=0.1.0",
+    # LiteLLM for OpenRouter/Ollama model routing through ADK
+    "litellm>=1.40.0",
     "requests>=2.31.0",
+    # Async SQLite driver required by ADK's DatabaseSessionService
+    "aiosqlite>=0.19.0",
 ]
 
 [project.optional-dependencies]

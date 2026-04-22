@@ -40,15 +40,23 @@ def _err(error: str) -> str:
 
 @app.tool()
 def parse_error(error_text: str) -> str:
-    """Parse an error message/stack trace and extract structured information.
+    """Parse an error message or stack trace into structured data.
 
-    Works with Python tracebacks, Node.js errors, Java stack traces, etc.
+    Call this FIRST when debugging any error. It extracts:
+    - error_type: The exception/error class name
+    - message: Human-readable error description
+    - file: Source file where the error occurred
+    - line: Line number of the error
+    - suggestions: Recommended fix actions
+
+    Supports Python tracebacks, Node.js errors, Java stack traces, Go errors,
+    and generic error formats.
 
     Args:
-        error_text: The error text or stack trace to analyze.
+        error_text: The full error text, stack trace, or stderr output.
 
     Returns:
-        JSON with error type, message, file, line number, and suggestions.
+        JSON with error_type, message, file, line, and suggestions.
     """
     result = {
         "error_type": None,

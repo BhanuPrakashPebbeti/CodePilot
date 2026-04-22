@@ -26,6 +26,8 @@ from urllib.error import URLError, HTTPError
 
 from fastmcp import FastMCP
 
+from codepilot.mcp.servers._env import get_clean_env
+
 app = FastMCP(name="testing")
 
 
@@ -47,6 +49,7 @@ def _execute(command: str, cwd: str = ".", timeout: int = 120) -> Dict[str, Any]
         result = subprocess.run(
             command, shell=True, cwd=cwd,
             capture_output=True, text=True, timeout=timeout,
+            env=get_clean_env(),
         )
         return {
             "stdout": result.stdout,

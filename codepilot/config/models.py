@@ -91,7 +91,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig
     github: GitHubConfig = Field(default_factory=GitHubConfig)
     work_dir: Path = Field(default_factory=lambda: Path.home() / "codepilot_projects")
-    version: str = "1.0.0"
+    version: str = "2.0.0"
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: Optional[datetime] = None
     

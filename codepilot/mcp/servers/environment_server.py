@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 from fastmcp import FastMCP
 
+from codepilot.mcp.servers._env import get_clean_env
+
 app = FastMCP(name="environment")
 
 
@@ -33,7 +35,8 @@ def _err(error: str) -> str:
 def _run(cmd: str, timeout: int = 15) -> Dict[str, Any]:
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout,
+            env=get_clean_env(),
         )
         return {"stdout": result.stdout.strip(), "stderr": result.stderr.strip(),
                 "exit_code": result.returncode, "success": result.returncode == 0}

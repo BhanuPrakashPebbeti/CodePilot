@@ -7,7 +7,7 @@ so that all commands can find node, npm, cargo, etc. without manual PATH setup.
 
 Tools:
   run_command              — Execute any shell command (blocking). Returns stdout, stderr, exit_code.
-  run_python               — Run Python code (inline string) or a Python .py file.
+  run_script               — Run a script file (.py, .js, .ts, .rb, .sh, .go, etc.) with auto-detected interpreter.
   start_background_process — Start a long-running process (server) in the background.
   stop_background_process  — Stop a background process by PID or port.
   wait_for_port            — Wait until a TCP port is accepting connections.
@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastmcp import FastMCP
+
+from codepilot.mcp.servers._env import get_clean_env
 
 app = FastMCP(name="bash")
 
@@ -50,37 +52,24 @@ def _err(error: str) -> str:
 
 
 def _get_env() -> Dict[str, str]:
-    """Get environment with version manager paths (nvm, cargo, etc.) included.
+    """Delegate to shared env isolation (see ``_env.py``)."""
+    return get_clean_env()
 
-    Ensures commands can find runtimes installed via nvm, rustup, etc.
-    even when they aren't in the default system PATH.
+
+def _resolve_cwd(cwd: str) -> Path:
+    """Resolve cwd — relative paths use CODEPILOT_PROJECT_DIR as base.
+
+    Same belt-and-suspenders approach as filesystem_server._resolve:
+    even when the subprocess already has the right CWD, we explicitly
+    resolve relative directories against the project root.
     """
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-
-    # Add nvm-managed Node.js to PATH
-    nvm_dir = env.get("NVM_DIR", os.path.join(str(Path.home()), ".nvm"))
-    nvm_versions = os.path.join(nvm_dir, "versions", "node")
-    if os.path.isdir(nvm_versions):
-        try:
-            versions = sorted(os.listdir(nvm_versions), reverse=True)
-            if versions:
-                node_bin = os.path.join(nvm_versions, versions[0], "bin")
-                if os.path.isdir(node_bin):
-                    env["PATH"] = node_bin + ":" + env.get("PATH", "")
-        except OSError:
-            pass
-
-    # Add cargo (Rust) to PATH
-    cargo_bin = os.path.join(str(Path.home()), ".cargo", "bin")
-    if os.path.isdir(cargo_bin):
-        env["PATH"] = cargo_bin + ":" + env.get("PATH", "")
-
-    # Add Go binaries to PATH
-    gopath_bin = os.path.join(env.get("GOPATH", os.path.join(str(Path.home()), "go")), "bin")
-    if os.path.isdir(gopath_bin):
-        env["PATH"] = gopath_bin + ":" + env.get("PATH", "")
-
-    return env
+    p = Path(cwd)
+    if p.is_absolute():
+        return p.resolve()
+    project_dir = os.environ.get("CODEPILOT_PROJECT_DIR")
+    if project_dir:
+        return (Path(project_dir) / p).resolve()
+    return p.resolve()
 
 
 def _execute(command: str, cwd: str = ".", timeout: int = 120) -> Dict[str, Any]:
@@ -90,7 +79,7 @@ def _execute(command: str, cwd: str = ".", timeout: int = 120) -> Dict[str, Any]
     process (passed via CODEPILOT_SUDO_PW env var).
     """
     try:
-        cwd_path = Path(cwd).resolve()
+        cwd_path = _resolve_cwd(cwd)
         if not cwd_path.is_dir():
             return {"stdout": "", "stderr": f"Directory not found: {cwd}", "exit_code": -1, "success": False}
 
@@ -185,47 +174,108 @@ def _execute_with_sudo(command: str, cwd_path: Path, timeout: int = 120) -> Dict
 
 @app.tool()
 def run_command(command: str, cwd: str = ".", timeout: int = 120) -> str:
-    """Run a shell command and return structured output.
+    """Execute a shell command (blocking) and return stdout/stderr.
+
+    Use for: installing packages, running builds, checking versions,
+    listing files, and any short-lived command.
+    Do NOT use for: writing source code files (use write_file instead),
+    or starting long-running servers (use start_background_process).
 
     Args:
-        command: Shell command to execute.
-        cwd: Working directory (default: current directory).
-        timeout: Timeout in seconds (default: 120).
+        command: Shell command to execute (e.g. "npm install", "make").
+        cwd: Working directory (default: project root).
+        timeout: Max seconds to wait (default: 120).
 
     Returns:
-        JSON with stdout, stderr, exit_code, success.
+        JSON with stdout, stderr, exit_code, and success boolean.
     """
     result = _execute(command, cwd, timeout)
-    return _ok(result) if result["success"] else _ok(result, f"Command failed with exit code {result['exit_code']}")
+
+    if result["success"]:
+        return _ok(result)
+
+    # ── Command FAILED — return a clear error with diagnosis guidance ──
+    # Truncate very long stderr to avoid token bloat, but keep enough
+    # for the agent to diagnose the root cause.
+    stderr = (result.get("stderr") or "").strip()
+    if len(stderr) > 3000:
+        stderr = stderr[:1500] + "\n\n... (truncated) ...\n\n" + stderr[-1500:]
+
+    return _err(
+        f"Command FAILED (exit code {result['exit_code']})\n"
+        f"Command: {command}\n"
+        f"stderr:\n{stderr}\n"
+        f"stdout:\n{(result.get('stdout') or '')[:1500]}\n\n"
+        "ACTION REQUIRED: Read the error above. Diagnose the root "
+        "cause BEFORE retrying. If a package version does not exist, "
+        "fix the version. If a dependency is missing, install it. "
+        "Do NOT retry the same command blindly."
+    )
 
 
 @app.tool()
-def run_python(code_or_file: str, cwd: str = ".", args: str = "") -> str:
-    """Run Python code (inline string) or a Python file.
+def run_script(file_path: str, cwd: str = ".", args: str = "") -> str:
+    """Run a script file using the appropriate interpreter.
 
-    If code_or_file ends with .py, runs it as a file.
-    Otherwise, executes it as inline code via `python -c`.
+    Automatically detects the language from the file extension and uses
+    the correct interpreter (python, node, ruby, bash, etc.).
+
+    Supported extensions:
+      .py  → python
+      .js  → node
+      .ts  → npx ts-node (or tsx)
+      .rb  → ruby
+      .sh  → bash
+      .pl  → perl
+      .lua → lua
+      .go  → go run
 
     Args:
-        code_or_file: Python file path or inline code string.
+        file_path: Path to the script file to execute.
         cwd: Working directory.
         args: Additional command-line arguments.
 
     Returns:
         JSON with execution result.
     """
-    if code_or_file.strip().endswith(".py"):
-        cmd = f"python {code_or_file}"
-    else:
-        # Inline code — use -c flag
-        escaped = code_or_file.replace("'", "'\"'\"'")
-        cmd = f"python -c '{escaped}'"
+    file_path = file_path.strip()
+    ext = Path(file_path).suffix.lower()
 
+    interpreter_map = {
+        ".py": "python",
+        ".js": "node",
+        ".ts": "npx ts-node",
+        ".rb": "ruby",
+        ".sh": "bash",
+        ".pl": "perl",
+        ".lua": "lua",
+        ".go": "go run",
+    }
+
+    interpreter = interpreter_map.get(ext)
+    if not interpreter:
+        return _err(f"Unsupported file extension '{ext}'. Use run_command for custom interpreters.")
+
+    cmd = f"{interpreter} {file_path}"
     if args:
         cmd += f" {args}"
 
     result = _execute(cmd, cwd)
-    return _ok(result)
+
+    if result["success"]:
+        return _ok(result)
+
+    stderr = (result.get("stderr") or "").strip()
+    if len(stderr) > 3000:
+        stderr = stderr[:1500] + "\n\n... (truncated) ...\n\n" + stderr[-1500:]
+
+    return _err(
+        f"Script FAILED (exit code {result['exit_code']})\n"
+        f"Script: {file_path}\n"
+        f"stderr:\n{stderr}\n"
+        f"stdout:\n{(result.get('stdout') or '')[:1500]}\n\n"
+        "Read the error output above. Diagnose before retrying."
+    )
 
 
 # ============================================================================
@@ -242,22 +292,27 @@ def start_background_process(
 ) -> str:
     """Start a long-running process in the background (e.g. a dev server).
 
-    Use this instead of run_command for servers (uvicorn, npm start, etc.)
-    that run indefinitely. The process keeps running after this call returns.
+    Use this instead of run_command for servers, watchers, daemons, or any
+    process that runs indefinitely. The process keeps running after this
+    function returns. Call stop_background_process to terminate it later.
+
+    IMPORTANT: Before starting a server, kill any stale process on the same
+    port using stop_background_process(port=PORT).
 
     Args:
-        command:      Shell command to run (e.g. "uvicorn main:app --port 8000").
-        cwd:          Working directory.
+        command:      Shell command to run (e.g. "npm run dev", "python app.py").
+        cwd:          Working directory (default: project root).
         log_file:     Optional file path to capture stdout+stderr.
                       If empty, a temp file is created automatically.
-        wait_port:    If > 0, wait for this port to start accepting connections
+        wait_port:    If > 0, wait for this TCP port to accept connections
                       before returning. This confirms the server is ready.
         wait_timeout: Seconds to wait for the port (default 15).
 
     Returns:
-        JSON with pid, log_file, and port_ready status.
+        JSON with pid, log_file, port_ready status. If the process dies
+        immediately, returns the log tail for debugging.
     """
-    cwd_path = Path(cwd).resolve()
+    cwd_path = _resolve_cwd(cwd)
     if not cwd_path.is_dir():
         return _err(f"Directory not found: {cwd}")
 
@@ -367,6 +422,7 @@ def stop_background_process(pid: int = 0, port: int = 0) -> str:
             result = subprocess.run(
                 f"lsof -i :{port} -t",
                 shell=True, capture_output=True, text=True,
+                env=_get_env(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 for p in result.stdout.strip().split("\n"):

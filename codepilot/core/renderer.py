@@ -108,7 +108,7 @@ TOOL_LABELS = {
     "list_directory":           "List",
     # Bash
     "run_command":         "Run",
-    "run_python":          "Python",
+    "run_script":          "Script",
     # Background process management
     "start_background_process": "Start server",
     "stop_background_process":  "Stop server",
@@ -168,6 +168,16 @@ TOOL_LABELS = {
     "get_repo_info":       "Repo info",
     "list_pull_requests":  "List PRs",
     "get_github_user":     "GitHub user",
+    # Browser / Playwright
+    "playwright_navigate":           "Navigate",
+    "playwright_screenshot":         "Screenshot",
+    "playwright_click":              "Click",
+    "playwright_fill":               "Fill",
+    "playwright_evaluate":           "Evaluate JS",
+    "playwright_get_text":           "Get text",
+    "playwright_wait_for_selector":  "Wait for",
+    # ADK loop control
+    "exit_loop":           "Exit loop",
 }
 
 # Tool categories for icon selection
@@ -175,7 +185,7 @@ _FILE_WRITE  = {"write_file","append_file","edit_lines","edit_line",
                 "replace_in_file","copy_file","move_file","delete_file"}
 _FILE_READ   = {"read_file","read_lines","file_exists"}
 _DIR         = {"create_directory","list_directory"}
-_BASH        = {"run_command","run_python",
+_BASH        = {"run_command","run_script",
                 "start_background_process","stop_background_process",
                 "wait_for_port","get_background_output"}
 _TEST        = {"run_tests","run_single_test","check_syntax",
@@ -193,6 +203,9 @@ _ENVIRONMENT = {"detect_runtimes","check_runtime",
                 "install_runtime","check_venv","create_venv"}
 _GITHUB      = {"create_repo","push_to_github","open_pull_request",
                 "get_repo_info","list_pull_requests","get_github_user"}
+_BROWSER     = {"playwright_navigate","playwright_screenshot","playwright_click",
+                "playwright_fill","playwright_evaluate","playwright_get_text",
+                "playwright_wait_for_selector"}
 
 
 def _tool_icon(name: str) -> str:
@@ -207,6 +220,7 @@ def _tool_icon(name: str) -> str:
     if name in _TASK:        return "📋"
     if name in _ENVIRONMENT: return "🌍"
     if name in _GITHUB:      return "🐙"
+    if name in _BROWSER:     return "🌐"
     return "⚙ "
 
 
@@ -218,6 +232,8 @@ def _infer_phase(tool_name: str) -> Phase:
         return Phase.PLAN
     if tool_name in (_FILE_WRITE | _DIR | _BASH):
         return Phase.EXECUTE
+    if tool_name in _BROWSER:
+        return Phase.VERIFY
     if tool_name in (_ENVIRONMENT):
         return Phase.PLAN
     if tool_name in _TEST:
@@ -241,18 +257,17 @@ class Renderer:
       ╭─ 💭 Planning ─────────────────────────╮
       │                                        │
       │  🗂  Detect project → ./               │
-      │     ✓ Python / FastAPI                  │
+      │     ✓ Detected project type              │
       │                                        │
       ╰────────────────────────────────────────╯
       
-      ╭─ 🔨 Executing ────────────────────────╮
+      ╭─ 🔨 Executing ──────────────────────╮
       │                                        │
-      │  📝 Write → src/main.py (45 lines)     │
+      │  📝 Write → src/main (45 lines)          │
       │     ✓ Written                          │
       │                                        │
-      │  💻 Run → pip install flask            │
+      │  💻 Run → install dependencies           │
       │     ✓ Installed                        │
-      │     │ Successfully installed flask-3.0 │
       │                                        │
       ╰────────────────────────────────────────╯
     """
@@ -511,11 +526,9 @@ class Renderer:
             cwd = args.get("cwd", "")
             loc = f" [dim](in {escape(cwd)})[/dim]" if cwd and cwd != "." else ""
             return f"[yellow]$ {escape(cmd)}[/yellow]{loc}"
-        if tool_name == "run_python":
-            code = args.get("code_or_file", "")
-            if "\n" in code or len(code) > 60:
-                return "[yellow]$ python <inline>[/yellow]"
-            return f"[yellow]$ python {escape(code)}[/yellow]"
+        if tool_name == "run_script":
+            fp = args.get("file_path", "")
+            return f"[yellow]$ {escape(fp)}[/yellow]"
 
         # Test & Verification
         if tool_name == "run_tests":
@@ -580,8 +593,8 @@ class Renderer:
         elif isinstance(data, str):
             stdout = data
 
-        msg = parsed.get("message", "")
-        err = parsed.get("error", "")
+        msg = str(parsed.get("message", ""))
+        err = str(parsed.get("error", ""))
 
         if ok:
             status = msg or "Done"
@@ -609,10 +622,10 @@ class Renderer:
             self._render_raw_fallback(raw)
             return
         if parsed.get("ok"):
-            msg = parsed.get("message", "Done")
+            msg = str(parsed.get("message", "Done"))
             console.print(f"     [green]✓ {escape(msg[:120])}[/green]", highlight=False)
         else:
-            err = parsed.get("error", "Failed")
+            err = str(parsed.get("error", "Failed"))
             console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
 
     def _render_test_result(self, tool_name: str, parsed: Optional[dict], raw: str) -> None:
@@ -622,12 +635,12 @@ class Renderer:
 
         ok = parsed.get("ok", False)
         data = parsed.get("data", {})
-        msg = parsed.get("message", "")
+        msg = str(parsed.get("message", ""))
 
         if ok:
             console.print(f"     [green]✓ {escape(msg or 'Passed')}[/green]", highlight=False)
         else:
-            err = parsed.get("error", "Failed")
+            err = str(parsed.get("error", "Failed"))
             console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
 
         # For test runners, show summary + output
@@ -665,7 +678,7 @@ class Renderer:
                 else:
                     console.print(f"     [green]✓ Done[/green]", highlight=False)
             else:
-                err = parsed.get("error", "Failed")
+                err = str(parsed.get("error", "Failed"))
                 console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
             return
 
@@ -698,10 +711,10 @@ class Renderer:
             self._render_raw_fallback(raw)
             return
         if parsed.get("ok"):
-            msg = parsed.get("message", "Done")
+            msg = str(parsed.get("message", "Done"))
             console.print(f"     [green]✓ {escape(msg[:120])}[/green]", highlight=False)
         else:
-            err = parsed.get("error", "Failed")
+            err = str(parsed.get("error", "Failed"))
             console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
 
     def _render_task_result(self, tool_name: str, parsed: Optional[dict], raw: str) -> None:
@@ -754,7 +767,7 @@ class Renderer:
                         highlight=False
                     )
         else:
-            err = parsed.get("error", "Failed")
+            err = str(parsed.get("error", "Failed"))
             console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
 
     def _render_debug_result(self, tool_name: str, parsed: Optional[dict], raw: str) -> None:
@@ -777,10 +790,10 @@ class Renderer:
                 for s in suggestions[:3]:
                     console.print(f"     [yellow]  💡 {escape(s)}[/yellow]", highlight=False)
                 return
-            msg = parsed.get("message", "Done")
+            msg = str(parsed.get("message", "Done"))
             console.print(f"     [green]✓ {escape(msg[:120])}[/green]", highlight=False)
         else:
-            err = parsed.get("error", "Failed")
+            err = str(parsed.get("error", "Failed"))
             console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
 
     def _render_status(self, parsed: Optional[dict], raw: str) -> None:

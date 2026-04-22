@@ -188,15 +188,33 @@ def create_plan(goal: str, tasks: str) -> str:
     """Create a development plan with ordered tasks.
 
     Args:
-        goal: High-level objective (e.g. "Build a React todo app with FastAPI backend")
-        tasks: Comma-separated list of ordered tasks
-               (e.g. "Set up project structure,Create FastAPI backend,Create React frontend,Connect frontend to backend,Test and verify")
+        goal: High-level objective (e.g. "Build a todo app with a REST API and database")
+        tasks: Pipe-separated list of ordered tasks. Use | as the delimiter.
+               (e.g. "Set up project structure | Create backend API | Create frontend UI | Connect frontend to backend | Test and verify")
+               IMPORTANT: Do NOT use commas as delimiters. Use | (pipe) characters.
     
     Returns structured plan with task IDs for tracking.
     """
+    # Always start fresh — delete any stale state from previous sessions.
+    # This prevents the "tasks already done" problem where a previous
+    # run's completed plan blocks the current run.
+    if os.path.exists(_STATE_FILE):
+        try:
+            os.remove(_STATE_FILE)
+        except OSError:
+            pass
+
     plan = Plan(goal=goal)
 
-    task_list = [t.strip() for t in tasks.split(",") if t.strip()]
+    # Split on pipe character; fall back to newlines if no pipes found
+    if "|" in tasks:
+        task_list = [t.strip() for t in tasks.split("|") if t.strip()]
+    elif "\n" in tasks:
+        task_list = [t.strip().lstrip("0123456789.-) ") for t in tasks.split("\n") if t.strip()]
+    else:
+        # Last resort: treat entire string as a single task
+        task_list = [tasks.strip()] if tasks.strip() else []
+
     if not task_list:
         return _err("No tasks provided")
 
@@ -385,7 +403,9 @@ def replan(reason: str, new_tasks: str = "") -> str:
     
     Args:
         reason: Why replanning is needed
-        new_tasks: Comma-separated new tasks to add (optional)
+        new_tasks: Pipe-separated new tasks to add (optional).
+                   Use | as the delimiter, NOT commas.
+                   Example: "Fix auth module | Add error handling | Retest API"
     """
     plan = Plan.load()
 
@@ -395,10 +415,15 @@ def replan(reason: str, new_tasks: str = "") -> str:
             task.status = "pending"
             task.error = None
 
-    # Add new tasks
+    # Add new tasks (pipe-separated, consistent with create_plan)
     added = []
     if new_tasks:
-        for title in [t.strip() for t in new_tasks.split(",") if t.strip()]:
+        if "|" in new_tasks:
+            parts = [t.strip() for t in new_tasks.split("|") if t.strip()]
+        else:
+            # Fallback: treat as single task if no pipe
+            parts = [new_tasks.strip()] if new_tasks.strip() else []
+        for title in parts:
             t = plan.add(title)
             added.append(t.to_dict())
 
