@@ -1,12 +1,12 @@
-"""SQLite-backed ADK memory service for persistent cross-session context.
+"""SQLite-backed ADK memory service for persistent, project-scoped session context.
 
 Implements ADK's ``BaseMemoryService`` so the ADK Runner can automatically
-persist session events to disk.  This means agent conversations survive
-process restarts and can be searched in future sessions.
+persist session events to disk.
 
-Agentic AI concept demonstrated:
-  Long-term / episodic memory — agents can recall what happened in previous
-  development sessions, avoiding repeat mistakes and building on past work.
+Session isolation:  The ``user_id`` passed to ADK is the project name
+(e.g. "kanban-board"), NOT a shared "user" constant.  This ensures that
+``search_memory`` only returns events from the same project — no cross-project
+leakage through the ADK memory layer.
 
 DB location: ``~/.codepilot/session_memory.db``
 """

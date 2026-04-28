@@ -1,19 +1,17 @@
-"""Package marker for core module.
-
-Shared utilities used by both the new ADK agents and legacy code.
-The legacy CodePilotAgent (LangGraph) lives in agent.py but is NOT
-imported here to avoid circular imports.
-"""
+"""Core utilities — shared across CLI, agents, and config."""
 
 from .exceptions import CodePilotError, ConfigurationError, LLMError, SessionError
+from .global_memory import GlobalMemory
 from .renderer import Renderer
-from .session import SessionManager
+from .session import SessionStore, SessionManager   # SessionManager is an alias for SessionStore
 
 __all__ = [
     "CodePilotError",
     "ConfigurationError",
     "LLMError",
     "SessionError",
+    "GlobalMemory",
     "Renderer",
+    "SessionStore",
     "SessionManager",
 ]

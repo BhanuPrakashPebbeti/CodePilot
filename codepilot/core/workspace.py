@@ -1,9 +1,4 @@
-"""Workspace selection and session locking.
-
-Handles the mandatory workspace prompt at session start.
-Once selected, the workspace path is returned and locked by the runner
-for the entire session.  No drift detection lives here — that is in drift.py.
-"""
+"""Workspace selection for new project sessions."""
 
 import re
 from pathlib import Path
@@ -90,43 +85,3 @@ def _prompt_alternate(cwd: Path) -> Path:
         workspace = cwd / name
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
-
-
-def prompt_on_drift(workspace: Path, history_summary: str, new_task: str) -> tuple[bool, Path | None]:
-    """Show the drift warning and ask the user what to do.
-
-    Called by the runner after the agentic drift detector flags a shift.
-
-    Returns:
-        (proceed, new_workspace)
-        - (True,  None)  → continue in current workspace
-        - (True,  path)  → switch workspace and continue
-        - (False, None)  → user cancelled the request
-    """
-    from ..core.renderer import console
-
-    console.print(
-        Panel(
-            "[yellow bold]⚠  Context Drift Detected[/yellow bold]\n\n"
-            f"[dim]Current workspace:[/dim] {workspace}\n"
-            f"[dim]Project context:[/dim]   {history_summary[:120]}{'…' if len(history_summary) > 120 else ''}\n"
-            f"[dim]New request:[/dim]       {new_task[:120]}{'…' if len(new_task) > 120 else ''}\n\n"
-            "[dim]This request looks unrelated to the current project.[/dim]",
-            border_style="yellow",
-            padding=(0, 1),
-        )
-    )
-
-    console.print("[bold]What would you like to do?[/bold]")
-    console.print("  [cyan]1.[/cyan] Continue in current workspace")
-    console.print("  [cyan]2.[/cyan] Switch to a different workspace (starts fresh)")
-    console.print("  [cyan]3.[/cyan] Cancel — skip this request")
-
-    choice = Prompt.ask("Select", choices=["1", "2", "3"], default="1")
-
-    if choice == "1":
-        return True, None
-    if choice == "2":
-        new_ws = select_workspace()
-        return True, new_ws
-    return False, None

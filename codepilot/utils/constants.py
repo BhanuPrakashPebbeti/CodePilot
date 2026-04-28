@@ -5,8 +5,17 @@ from pathlib import Path
 # Directories
 CONFIG_DIR = Path.home() / ".codepilot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-SESSIONS_DIR = CONFIG_DIR / "sessions"
+SESSIONS_DIR = CONFIG_DIR / "sessions"   # ~/.codepilot/sessions/<project_name>/
 LOGS_DIR = CONFIG_DIR / "logs"
+
+# Per-project session filenames (inside SESSIONS_DIR/<project_name>/)
+SESSION_METADATA_FILE = "metadata.json"
+SESSION_MESSAGES_FILE = "messages.json"
+SESSION_MEMORY_FILE   = "memory.json"
+SESSION_SUMMARY_FILE  = "summary.json"
+
+# Cross-session global memory
+GLOBAL_MEMORY_FILE = CONFIG_DIR / "global_memory.json"
 
 # Default values
 DEFAULT_WORK_DIR = Path.home() / "codepilot_projects"

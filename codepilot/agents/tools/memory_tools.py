@@ -1,7 +1,9 @@
-"""Local memory tools — direct SQLite access, replaces memory_server.py MCP.
+"""Local memory tools — direct SQLite access for structured agent memories.
 
-Agents call these to store and retrieve structured memories across sessions.
-Direct SQLite access (no subprocess) is faster and more reliable than MCP.
+Agents call these to store and retrieve memories across sessions.
+Every memory entry is scoped to a project directory to prevent cross-session
+leakage.  The project is resolved from the CODEPILOT_PROJECT_DIR env var
+if not explicitly provided.
 
 Memory types
 ------------
@@ -12,9 +14,9 @@ preference    — user preferences
 """
 
 import json
+import os
 import sqlite3
 import time
-from pathlib import Path
 from typing import Optional
 
 from google.adk.tools.tool_context import ToolContext
@@ -43,6 +45,14 @@ CREATE INDEX IF NOT EXISTS idx_updated ON memories(updated);
 """
 
 _VALID_TYPES = {"conversation", "project", "error_fix", "preference"}
+
+
+def _resolve_project(project: str) -> str:
+    """Return project path, falling back to the locked workspace env var.
+
+    Never returns an empty string — always scopes the memory to a project.
+    """
+    return project or os.environ.get("CODEPILOT_PROJECT_DIR", "") or "global"
 
 
 def _conn() -> sqlite3.Connection:
@@ -82,6 +92,7 @@ def store_memory(
     """
     if type not in _VALID_TYPES:
         return {"ok": False, "error": f"Invalid type '{type}'. Use: {_VALID_TYPES}"}
+    scoped_project = _resolve_project(project)
     tag_list = json.dumps([t.strip() for t in tags.split(",") if t.strip()])
     now = int(time.time())
     try:
@@ -92,7 +103,7 @@ def store_memory(
                    ON CONFLICT(key) DO UPDATE SET
                      content=excluded.content, type=excluded.type,
                      project=excluded.project, tags=excluded.tags, updated=excluded.updated""",
-                (type, key, content, project or None, tag_list, now, now),
+                (type, key, content, scoped_project, tag_list, now, now),
             )
             return {"ok": True, "memory_id": cursor.lastrowid, "key": key}
     except Exception as e:
@@ -117,14 +128,14 @@ def search_memories(
     Returns:
         dict with ok and results (list of memory dicts).
     """
+    scoped_project = _resolve_project(project)
     clauses = ["(content LIKE ? OR key LIKE ?)"]
     params: list = [f"%{query}%", f"%{query}%"]
     if type and type in _VALID_TYPES:
         clauses.append("type = ?")
         params.append(type)
-    if project:
-        clauses.append("(project = ? OR project IS NULL)")
-        params.append(project)
+    clauses.append("project = ?")
+    params.append(scoped_project)
     params.append(limit)
     sql = f"SELECT * FROM memories WHERE {' AND '.join(clauses)} ORDER BY updated DESC LIMIT ?"
     try:
@@ -151,12 +162,9 @@ def get_recent_conversations(
     Returns:
         dict with ok and conversations (list of {key, content, updated}).
     """
-    clauses = ["type = 'conversation'"]
-    params: list = []
-    if project:
-        clauses.append("(project = ? OR project IS NULL)")
-        params.append(project)
-    params.append(limit)
+    scoped_project = _resolve_project(project)
+    clauses = ["type = 'conversation'", "project = ?"]
+    params: list = [scoped_project, limit]
     sql = f"SELECT key, content, project, updated FROM memories WHERE {' AND '.join(clauses)} ORDER BY updated DESC LIMIT ?"
     try:
         with _conn() as conn:

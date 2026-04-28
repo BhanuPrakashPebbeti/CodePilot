@@ -23,7 +23,6 @@ import asyncio
 import json
 import logging as _logging
 import os
-import sqlite3
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,10 +52,9 @@ from rich.panel import Panel
 
 from .builder import build_codepilot_agent
 from ..config import ConfigManager
-from ..core.drift import DriftDetector
+from ..core.global_memory import GlobalMemory
 from ..core.renderer import Renderer, console
-from ..core.session import SessionManager
-from ..core.workspace import prompt_on_drift
+from ..core.session import SessionStore
 from ..memory import SqliteMemoryService
 from ..utils.constants import (
     CONFIG_DIR,
@@ -101,28 +99,27 @@ def _is_transient(exc: Exception) -> bool:
 # ---------------------------------------------------------------------------
 
 class CodePilotRunner:
-    """Runs the CodePilot ADK pipeline with persistence and Rich rendering.
+    """Runs the CodePilot ADK pipeline with full per-project session isolation.
 
-    Wraps ``google.adk.runners.Runner`` with:
-    - Persistent ADK sessions (DatabaseSessionService, SQLite)
-    - Persistent session-event memory (SqliteMemoryService)
-    - Rich terminal rendering of all agent events
-    - Local session tracking for CLI ``codepilot sessions`` command
-    - Transient error retry (network drops, rate limits)
-    - Memory context injection in interactive (REPL) mode
+    Each project gets its own SessionStore (messages, memory, summaries) and
+    its own ADK user_id so that no session event ever leaks into another project.
+
+    Context passed to the LLM is built by SessionStore.build_context() which
+    combines: rolling summary + high-priority messages + recent messages +
+    relevant long-term memory.  Global user preferences are prepended from
+    GlobalMemory.get_context().
     """
 
     def __init__(
         self,
         config_manager: ConfigManager,
-        workspace: Path,                       # required — set by select_workspace()
-        session_manager: Optional[SessionManager] = None,
+        session_store: SessionStore,           # project-scoped session (never shared)
         max_iterations: int = 8,
     ) -> None:
         self.config_manager = config_manager
-        self.workspace = workspace.resolve()   # locked workspace — never changes
-        self.project_dir = str(self.workspace) # string alias used by agents
-        self.session_manager = session_manager or SessionManager(self.project_dir)
+        self.session_store = session_store
+        self.workspace = Path(session_store.workspace_path).resolve()
+        self.project_dir = str(self.workspace)
         self.max_iterations = max_iterations
         self.renderer = Renderer()
 
@@ -134,17 +131,9 @@ class CodePilotRunner:
         self.notion_token = cfg.notion.token if cfg.notion else None
         self.slack_token = cfg.slack.bot_token if cfg.slack else None
 
-        # Context drift tracking
-        self._task_history: list[str] = []    # descriptions of completed tasks (oldest first)
-        self._drift_detector = DriftDetector(
-            provider=self.provider,
-            model=self.model,
-            api_key=self.api_key,
-        )
-
         self._configure_env()
 
-        # Initialise persistent services (created once per runner instance)
+        # ADK persistence — user_id = project_name ensures complete isolation
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self._session_service = DatabaseSessionService(
             db_url=f"sqlite+aiosqlite:///{_SESSIONS_DB}"
@@ -179,21 +168,6 @@ class CodePilotRunner:
         # Workspace is locked — set once, never overwritten
         os.environ["CODEPILOT_PROJECT_DIR"] = self.project_dir
 
-    def switch_workspace(self, new_workspace: Path) -> None:
-        """Switch to a new workspace (only triggered from the REPL drift prompt).
-
-        Resets task history so the drift detector re-learns the new project.
-        """
-        self.workspace = new_workspace.resolve()
-        self.project_dir = str(self.workspace)
-        self.session_manager = SessionManager(self.project_dir)
-        self._task_history = []                    # reset — new project starts fresh
-        os.environ["CODEPILOT_PROJECT_DIR"] = self.project_dir
-        console.print(
-            f"\n[green]✓ Workspace switched:[/green] [bold]{self.workspace}[/bold]\n"
-        )
-        logger.info("Workspace switched to: %s", self.workspace)
-
     # ── Stale-state cleanup ───────────────────────────────────────────────
 
     @staticmethod
@@ -207,38 +181,27 @@ class CodePilotRunner:
 
     # ── Memory context helpers ────────────────────────────────────────────
 
-    def _load_memory_context(self) -> str:
-        """Read recent structured memories for this project.
+    def _load_memory_context(self, task: str = "") -> str:
+        """Build the LLM context block for the current task.
 
-        Queries the local memory SQLite database directly (faster
-        than going through an MCP subprocess just for context loading).
-        Returns a formatted context block, or empty string if no memories.
+        Combines (in priority order):
+          1. Global user preferences (cross-session)
+          2. Per-session context: summary + high-priority messages + recent messages
+          3. Relevant long-term memory entries matching the current task
+
+        Returns an empty string when there is nothing useful to inject.
         """
-        try:
-            if not _STRUCTURED_MEMORY_DB.exists():
-                return ""
-            with sqlite3.connect(str(_STRUCTURED_MEMORY_DB)) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    """
-                    SELECT type, content FROM memories
-                    WHERE (project = ? OR project IS NULL)
-                      AND type IN ('conversation', 'project', 'error_fix')
-                    ORDER BY updated DESC
-                    LIMIT 5
-                    """,
-                    (self.project_dir,),
-                ).fetchall()
-            if not rows:
-                return ""
-            lines = ["[Memory from previous sessions]"]
-            for row in rows:
-                lines.append(f"[{row['type']}] {row['content']}")
-            lines.append("[End memory]")
-            return "\n".join(lines) + "\n\n"
-        except Exception as exc:
-            logger.debug("Could not load memory context: %s", exc)
-            return ""
+        parts: list[str] = []
+
+        global_ctx = GlobalMemory.get_context()
+        if global_ctx:
+            parts.append(global_ctx)
+
+        session_ctx = self.session_store.build_context(task)
+        if session_ctx:
+            parts.append(session_ctx.strip())
+
+        return ("\n\n".join(parts) + "\n\n") if parts else ""
 
     # ── Public run API ────────────────────────────────────────────────────
 
@@ -257,12 +220,6 @@ class CodePilotRunner:
             console.print(f"\n[red]Pipeline error:[/red] {e}")
             logger.exception("Pipeline execution failed")
             raise
-        finally:
-            # Record task in history regardless of success/failure.
-            # Keep last 10 entries — enough for drift detection, cheap to store.
-            self._task_history.append(task)
-            if len(self._task_history) > 10:
-                self._task_history.pop(0)
 
     async def _run_async(self, task: str, memory_context: str = "") -> None:
         self._cleanup_stale_plan_state()
@@ -284,13 +241,12 @@ class CodePilotRunner:
             memory_service=self._memory_service,
         )
 
-        # Kept at this scope so retries can spin up a fresh session with the
-        # same clean state instead of trying to resume a broken invocation.
+        # Clean per-run ADK state — scoped to this project via user_id.
+        # review_output removed (ReviewAgent was removed from pipeline).
         _initial_state = {
             "project_dir":     self.project_dir,
             "plan_summary":    "",
             "iteration_count": "0",
-            "review_output":   "",
             "app_type":        "",
             "app_url":         "",
             "app_ready":       "false",
@@ -299,18 +255,24 @@ class CodePilotRunner:
             "test_errors":     "",
             "debug_log":       "",
             "final_status":    "",
+            "notion_project_id": "",
+            "github_repo_url":   "",
+            "hitl_decision":     "",
+            "screenshot_paths":  "",
         }
+
+        # user_id = project name — isolates this project's ADK session events
+        # from every other project in the shared sessions.db / session_memory.db
+        _project_user_id = self.session_store.project_name
 
         session = await self._session_service.create_session(
             app_name="codepilot",
-            user_id="user",
+            user_id=_project_user_id,
             state=_initial_state,
         )
 
-        # Local session tracking
-        local_session = self.session_manager.start_session()
-        local_task = self.session_manager.add_task(task)
-        self.session_manager.start_task(local_task.task_id)
+        # Record the user message in the per-project session store
+        self.session_store.add_message("user", task)
 
         self.renderer.reset()
         console.print(
@@ -368,31 +330,34 @@ class CodePilotRunner:
                     # with new_message=None — it requires a fresh session.
                     session = await self._session_service.create_session(
                         app_name="codepilot",
-                        user_id="user",
+                        user_id=_project_user_id,
                         state=_initial_state,
                     )
 
-            # Persist session events to long-term memory
+            # Persist ADK session events to project-scoped long-term memory
             try:
                 completed = await self._session_service.get_session(
                     app_name="codepilot",
-                    user_id="user",
+                    user_id=_project_user_id,
                     session_id=session.id,
                 )
                 if completed:
                     await self._memory_service.add_session_to_memory(completed)
+                # Save the pipeline's final status as an assistant message
+                final_status = (completed.state or {}).get("final_status", "") if completed else ""
+                if final_status:
+                    self.session_store.add_message("assistant", final_status)
             except Exception as exc:
                 logger.debug("Memory persistence skipped: %s", exc)
 
-            self.session_manager.complete_task(local_task.task_id)
-
         except Exception as e:
-            self.session_manager.fail_task(local_task.task_id, str(e))
+            self.session_store.add_message(
+                "assistant", f"Pipeline failed: {e}", priority="high"
+            )
             raise
 
         finally:
             self.renderer.on_complete()
-            self.session_manager.end_session()
 
     # ── Event handler ─────────────────────────────────────────────────────
 
@@ -495,32 +460,16 @@ class CodePilotRunner:
                     continue
                 if cmd == "workspace":
                     console.print(
-                        f"[cyan]Locked workspace:[/cyan] [bold]{self.workspace}[/bold]"
+                        f"[cyan]Project:[/cyan]   [bold]{self.session_store.project_name}[/bold]\n"
+                        f"[cyan]Workspace:[/cyan] [bold]{self.workspace}[/bold]"
                     )
                     continue
 
-                # ── Agentic context-drift check ───────────────────────────
-                if self._task_history:
-                    console.print("[dim]Checking context…[/dim]", end="\r")
-                    drift = self._drift_detector.check(self._task_history, task)
-                    console.print(" " * 25, end="\r")   # clear the "Checking" line
-
-                    if drift:
-                        history_summary = " → ".join(self._task_history[-3:])
-                        proceed, new_ws = prompt_on_drift(
-                            self.workspace, history_summary, task
-                        )
-                        if not proceed:
-                            console.print("[dim]Request cancelled.[/dim]")
-                            continue
-                        if new_ws:
-                            self.switch_workspace(new_ws)
-
                 # ── Load memory context ───────────────────────────────────
-                memory_ctx = self._load_memory_context()
+                memory_ctx = self._load_memory_context(task)
                 if memory_ctx:
                     console.print(
-                        "[dim]↳ Memory context loaded from previous sessions[/dim]"
+                        "[dim]↳ Session context loaded[/dim]"
                     )
 
                 self.run(task, memory_context=memory_ctx)
@@ -535,10 +484,10 @@ class CodePilotRunner:
                 logger.exception("Interactive task failed")
 
     def _show_memory(self) -> None:
-        """Show recent structured memories for the current project."""
+        """Show session context and long-term memory for this project."""
         ctx = self._load_memory_context()
         if ctx:
-            console.print(Panel(ctx, title="Memory", border_style="dim"))
+            console.print(Panel(ctx.strip(), title=f"Memory — {self.session_store.project_name}", border_style="dim"))
         else:
             console.print("[dim]No memory found for this project yet.[/dim]")
 
@@ -547,18 +496,16 @@ class CodePilotRunner:
             Panel(
                 "[bold]Commands:[/bold]\n"
                 "  [cyan]<task>[/cyan]       — Run a development task in the locked workspace\n"
-                "  [cyan]workspace[/cyan]    — Show the locked workspace path\n"
+                "  [cyan]workspace[/cyan]    — Show project name and workspace path\n"
                 "  [cyan]memory[/cyan]       — Show memory from previous sessions\n"
                 "  [cyan]clear[/cyan]        — Clear the terminal\n"
                 "  [cyan]history[/cyan]      — Show command history\n"
                 "  [cyan]help[/cyan]         — Show this help\n"
                 "  [cyan]exit[/cyan]         — End the session\n"
                 "  [cyan]↑/↓[/cyan]          — Navigate previous commands\n\n"
-                "[bold]Workspace rules:[/bold]\n"
-                "  • All file operations are confined to the locked workspace\n"
-                "  • Paths outside the workspace are automatically rejected\n"
-                "  • If your request seems unrelated to the current project,\n"
-                "    CodePilot will ask before switching workspaces\n\n"
+                "[bold]Session rules:[/bold]\n"
+                "  • All file operations are confined to this project's workspace\n"
+                "  • To work on a different project, open a separate session\n\n"
                 "[bold]Examples:[/bold]\n"
                 '  "Create a REST API with Flask and PostgreSQL"\n'
                 '  "Build a CLI tool that converts CSV to JSON"\n'
@@ -579,11 +526,10 @@ class CodePilotRunner:
 
 def create_codepilot_runner(
     config_manager: ConfigManager,
-    workspace: Path,
-    session_manager: Optional[SessionManager] = None,
+    session_store: SessionStore,
 ) -> CodePilotRunner:
+    """Create a CodePilotRunner bound to a named project session."""
     return CodePilotRunner(
         config_manager=config_manager,
-        workspace=workspace,
-        session_manager=session_manager,
+        session_store=session_store,
     )

@@ -11,7 +11,8 @@ from rich.table import Table
 from .config import ConfigManager
 from .agents import create_codepilot_runner
 from .core.exceptions import CodePilotError, ConfigurationError
-from .core.session import SessionManager
+from .core.global_memory import GlobalMemory
+from .core.session import SessionStore
 from .core.workspace import select_workspace
 from .utils import console, enable_debug_mode, get_logger
 from .utils.constants import (
@@ -199,67 +200,226 @@ def interactive_config_setup() -> bool:
 
 
 # ============================================================================
-# MAIN COMMAND
+# SESSION COMMANDS  (create / open / list / delete)
 # ============================================================================
 
-@app.command(name="run")
-def run_command(
-    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode"),
+def _require_config(debug: bool = False) -> ConfigManager:
+    """Load config, triggering interactive setup if missing."""
+    config_manager = ConfigManager()
+    if not config_manager.exists:
+        if not interactive_config_setup():
+            raise typer.Exit(1)
+    return config_manager
+
+
+def _start_session(
+    store: SessionStore,
+    config_manager: ConfigManager,
+    debug: bool,
 ) -> None:
-    """Start an interactive CodePilot session.
-
-    Workspace is selected interactively at session start and locked for the
-    entire session.  All agent operations are confined to that directory.
-
-    Example:
-        codepilot run
-        codepilot run --debug
-    """
-    if debug:
-        enable_debug_mode()
+    """Common entry point: build runner and start the interactive REPL."""
+    cfg = config_manager.config
+    console.print(f"[dim]Provider: {cfg.llm.active_provider} | Model: {cfg.llm.active_model}[/dim]")
+    console.print(f"[dim]Project:  {store.project_name}[/dim]")
+    console.print(f"[dim]Workspace: {store.workspace_path}[/dim]\n")
 
     try:
-        show_banner()
-
-        # Load or create configuration
-        config_manager = ConfigManager()
-        if not config_manager.exists:
-            if not interactive_config_setup():
-                raise typer.Exit(1)
-
-        config = config_manager.config
-        provider = config.llm.active_provider
-        model = config.llm.active_model
-        console.print(f"[dim]Provider: {provider} | Model: {model}[/dim]")
-
-        # Mandatory workspace selection — locked for entire session
-        workspace = select_workspace()
-
-        runner = create_codepilot_runner(config_manager, workspace)
+        runner = create_codepilot_runner(config_manager, store)
         runner.run_interactive()
-
     except ConfigurationError as e:
         console.print(f"[red]Configuration error:[/red] {e}")
         raise typer.Exit(1)
-
     except CodePilotError as e:
         console.print(f"[red]Error:[/red] {e}")
         if debug:
             raise
         raise typer.Exit(1)
-
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted[/yellow]")
+        console.print("\n[yellow]Session paused — resume with: codepilot open {store.project_name}[/yellow]")
         raise typer.Exit(0)
-
     except SystemExit:
         raise typer.Exit(0)
-
     except Exception as e:
         console.print(f"[red]Unexpected error:[/red] {e}")
         if debug:
             raise
         raise typer.Exit(1)
+
+
+@app.command("create")
+def create_command(
+    project_name: str = typer.Argument(..., help="Name for the new project session"),
+    priority: str = typer.Option("medium", "--priority", "-p", help="high / medium / low"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode"),
+) -> None:
+    """Create a new isolated project session and start the REPL.
+
+    A new workspace directory is selected interactively.
+    Each project gets its own memory, messages, and conversation history.
+
+    Examples:
+        codepilot create kanban-board
+        codepilot create my-api --priority high
+    """
+    if debug:
+        enable_debug_mode()
+    show_banner()
+
+    config_manager = _require_config(debug)
+    store = SessionStore(project_name)
+
+    if store.exists():
+        console.print(
+            f"[yellow]Session '{store.project_name}' already exists.[/yellow]\n"
+            f"To resume it run: [cyan]codepilot open {store.project_name}[/cyan]"
+        )
+        raise typer.Exit(1)
+
+    workspace = select_workspace()
+    store.create(workspace_path=str(workspace), priority=priority)
+    console.print(f"[green]✓ Session created:[/green] [bold]{store.project_name}[/bold]")
+
+    _start_session(store, config_manager, debug)
+
+
+@app.command("open")
+def open_command(
+    project_name: str = typer.Argument(..., help="Name of the project session to resume"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode"),
+) -> None:
+    """Resume an existing project session.
+
+    Loads the project's memory, conversation history, and workspace path.
+    Context from previous interactions is automatically injected into the LLM.
+
+    Example:
+        codepilot open kanban-board
+    """
+    if debug:
+        enable_debug_mode()
+    show_banner()
+
+    config_manager = _require_config(debug)
+    store = SessionStore(project_name)
+
+    if not store.exists():
+        console.print(
+            f"[red]Session '{store.project_name}' not found.[/red]\n"
+            f"Create it with: [cyan]codepilot create {project_name}[/cyan]\n"
+            f"Or list existing sessions: [cyan]codepilot list[/cyan]"
+        )
+        raise typer.Exit(1)
+
+    store.load_metadata()
+    _start_session(store, config_manager, debug)
+
+
+@app.command("list")
+def list_command() -> None:
+    """List all project sessions with status and last-active time.
+
+    Example:
+        codepilot list
+    """
+    sessions = SessionStore.list_all()
+
+    if not sessions:
+        console.print(
+            "[yellow]No sessions found.[/yellow]\n"
+            "Create one with: [cyan]codepilot create <project-name>[/cyan]"
+        )
+        return
+
+    table = Table(title="CodePilot Sessions", show_lines=False)
+    table.add_column("Project", style="cyan", no_wrap=True)
+    table.add_column("Priority", style="dim", justify="center")
+    table.add_column("Workspace", style="dim", overflow="fold")
+    table.add_column("Last Active", style="green", no_wrap=True)
+    table.add_column("Created", style="dim", no_wrap=True)
+
+    for s in sessions:
+        last = s.get("last_active", "")[:19].replace("T", " ")
+        created = s.get("created_at", "")[:10]
+        table.add_row(
+            s.get("project_name", "?"),
+            s.get("priority", "medium"),
+            s.get("workspace_path", ""),
+            last,
+            created,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]{len(sessions)} session(s). Resume with: codepilot open <project>[/dim]")
+
+
+@app.command("delete")
+def delete_command(
+    project_name: str = typer.Argument(..., help="Project session to delete"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+) -> None:
+    """Delete a project session and all its memory.
+
+    This permanently removes messages, memory, and summaries for the project.
+
+    Example:
+        codepilot delete kanban-board
+        codepilot delete kanban-board --force
+    """
+    store = SessionStore(project_name)
+    if not store.exists():
+        console.print(f"[red]Session '{store.project_name}' not found.[/red]")
+        raise typer.Exit(1)
+
+    if not force:
+        if not Confirm.ask(f"Delete session '{store.project_name}' and all its memory?"):
+            raise typer.Exit(0)
+
+    if SessionStore.delete(store.project_name):
+        console.print(f"[green]✓ Session '{store.project_name}' deleted.[/green]")
+    else:
+        console.print("[red]Failed to delete session.[/red]")
+        raise typer.Exit(1)
+
+
+@app.command(name="run", hidden=True)
+def run_command(
+    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode"),
+) -> None:
+    """[Deprecated] Prompts for a project name then creates or opens it.
+
+    Prefer: codepilot create <name>  or  codepilot open <name>
+    """
+    if debug:
+        enable_debug_mode()
+    show_banner()
+
+    config_manager = _require_config(debug)
+    sessions = SessionStore.list_all()
+
+    if sessions:
+        console.print("[bold]Existing sessions:[/bold]")
+        for s in sessions[:5]:
+            console.print(f"  • [cyan]{s['project_name']}[/cyan]  [dim]{s.get('last_active','')[:10]}[/dim]")
+        if len(sessions) > 5:
+            console.print(f"  [dim]... and {len(sessions) - 5} more (codepilot list)[/dim]")
+
+    project_name = Prompt.ask(
+        "\nProject name (new name to create, existing name to open)"
+    ).strip()
+
+    if not project_name:
+        raise typer.Exit(0)
+
+    store = SessionStore(project_name)
+    if store.exists():
+        store.load_metadata()
+        console.print(f"[dim]Resuming existing session…[/dim]")
+    else:
+        workspace = select_workspace()
+        store.create(workspace_path=str(workspace))
+        console.print(f"[green]✓ Session created:[/green] [bold]{store.project_name}[/bold]")
+
+    _start_session(store, config_manager, debug)
 
 
 # Make run the default command
@@ -796,60 +956,42 @@ def config_reset(
 
 
 # ============================================================================
-# SESSION COMMANDS
+# GLOBAL MEMORY COMMAND
 # ============================================================================
 
-@app.command("sessions")
-def sessions_command(
-    delete: Optional[str] = typer.Option(None, "--delete", "-d", help="Delete session by ID"),
-    clear: bool = typer.Option(False, "--clear", help="Clear all sessions"),
+@app.command("memory")
+def memory_command(
+    set_key: Optional[str] = typer.Option(None, "--set", help="Key to set (e.g. preferred_stack)"),
+    value: Optional[str] = typer.Option(None, "--value", help="Value to store"),
+    show: bool = typer.Option(False, "--show", help="Print all global memory"),
 ) -> None:
-    """View and manage sessions.
-    
+    """View or update cross-session global memory (user preferences).
+
     Examples:
-        codepilot sessions                  # List all sessions
-        codepilot sessions --delete abc123  # Delete specific session
-        codepilot sessions --clear          # Clear all sessions
+        codepilot memory --show
+        codepilot memory --set preferred_stack --value "React + FastAPI"
+        codepilot memory --set coding_style --value modular
     """
-    try:
-        if clear:
-            if typer.confirm("⚠️  Delete all sessions?"):
-                count = SessionManager.clear_all_sessions()
-                console.print(f"[green]✅ Deleted {count} sessions[/green]")
-            return
-        
-        if delete:
-            if SessionManager.delete_session(delete):
-                console.print(f"[green]✅ Deleted session {delete[:8]}[/green]")
-            else:
-                console.print(f"[red]Session not found[/red]")
-            return
-        
-        # List sessions
-        sessions = SessionManager.list_sessions()
-        
-        if not sessions:
-            console.print("[yellow]No sessions found[/yellow]")
-            return
-        
-        table = Table(title="Sessions")
-        table.add_column("ID", style="cyan")
-        table.add_column("Tasks", style="green")
-        table.add_column("Date", style="dim")
-        
-        for session in sessions[:10]:  # Show last 10
-            session_id = session["session_id"][:8]
-            task_count = len(session.get("tasks", []))
-            created = session["created_at"][:10]
-            
-            table.add_row(session_id, str(task_count), created)
-        
-        console.print(table)
-        console.print(f"\n[dim]Showing {min(10, len(sessions))} of {len(sessions)} sessions[/dim]")
-    
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    if set_key and value is not None:
+        GlobalMemory.set(set_key, value)
+        console.print(f"[green]✓ Set[/green] [cyan]{set_key}[/cyan] = {value}")
+        return
+
+    data = GlobalMemory.load()
+    if not any(v for v in data.values()):
+        console.print(
+            "[yellow]No global memory set.[/yellow]\n"
+            "Example: [cyan]codepilot memory --set preferred_stack --value 'React + FastAPI'[/cyan]"
+        )
+        return
+
+    table = Table(title="Global Memory", show_lines=False)
+    table.add_column("Key", style="cyan")
+    table.add_column("Value", style="green")
+    for k, v in data.items():
+        if v:
+            table.add_row(k, str(v)[:80])
+    console.print(table)
 
 
 # ============================================================================
