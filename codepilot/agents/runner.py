@@ -128,6 +128,8 @@ class CodePilotRunner:
         self.model = cfg.llm.active_model
         self.api_key = cfg.llm.api_key
         self.github_token = cfg.github.token if cfg.github else None
+        self.notion_token = cfg.notion.token if cfg.notion else None
+        self.slack_token = cfg.slack.bot_token if cfg.slack else None
 
         self._configure_env()
 
@@ -222,6 +224,8 @@ class CodePilotRunner:
             model=self.model,
             api_key=self.api_key,
             github_token=self.github_token,
+            notion_token=self.notion_token,
+            slack_token=self.slack_token,
             max_iterations=self.max_iterations,
         )
 
@@ -232,23 +236,27 @@ class CodePilotRunner:
             memory_service=self._memory_service,
         )
 
+        # Kept at this scope so retries can spin up a fresh session with the
+        # same clean state instead of trying to resume a broken invocation.
+        _initial_state = {
+            "project_dir":     self.project_dir,
+            "plan_summary":    "",
+            "iteration_count": "0",
+            "review_output":   "",
+            "app_type":        "",
+            "app_url":         "",
+            "app_ready":       "false",
+            "runtime_error":   "",
+            "test_result":     "",
+            "test_errors":     "",
+            "debug_log":       "",
+            "final_status":    "",
+        }
+
         session = await self._session_service.create_session(
             app_name="codepilot",
             user_id="user",
-            state={
-                "project_dir":    self.project_dir,
-                "plan_summary":   "",
-                "iteration_count": "0",
-                "review_output":  "",
-                "app_type":       "",
-                "app_url":        "",
-                "app_ready":      "false",
-                "runtime_error":  "",
-                "test_result":    "",
-                "test_errors":    "",
-                "debug_log":      "",
-                "final_status":   "",
-            },
+            state=_initial_state,
         )
 
         # Local session tracking
@@ -273,7 +281,6 @@ class CodePilotRunner:
         )
 
         try:
-            msg: Optional[genai_types.Content] = user_msg
             attempts = 0
 
             while True:
@@ -281,7 +288,7 @@ class CodePilotRunner:
                     async for event in runner.run_async(
                         user_id="user",
                         session_id=session.id,
-                        new_message=msg,
+                        new_message=user_msg,
                     ):
                         self._handle_event(event)
                     break
@@ -290,14 +297,31 @@ class CodePilotRunner:
                     attempts += 1
                     if not _is_transient(inner) or attempts > _MAX_RETRIES:
                         raise
+
+                    # Rate-limit errors need a full minute to reset.
+                    # All other transient errors (network, 503) retry quickly.
+                    is_rate_limit = (
+                        "rate limit" in str(inner).lower()
+                        or "429" in str(inner)
+                        or type(inner).__name__ == "RateLimitError"
+                    )
+                    wait = 65.0 if is_rate_limit else _RETRY_DELAY
+
                     console.print(
                         f"\n[yellow]⚠ Transient error "
                         f"(attempt {attempts}/{_MAX_RETRIES}):[/yellow] "
                         f"{type(inner).__name__}: {inner}\n"
-                        f"[dim]Retrying in {_RETRY_DELAY}s…[/dim]"
+                        f"[dim]Retrying in {wait:.0f}s…[/dim]"
                     )
-                    await asyncio.sleep(_RETRY_DELAY)
-                    msg = None  # resume — don't re-send user message
+                    await asyncio.sleep(wait)
+
+                    # DatabaseSessionService cannot resume a broken invocation
+                    # with new_message=None — it requires a fresh session.
+                    session = await self._session_service.create_session(
+                        app_name="codepilot",
+                        user_id="user",
+                        state=_initial_state,
+                    )
 
             # Persist session events to long-term memory
             try:

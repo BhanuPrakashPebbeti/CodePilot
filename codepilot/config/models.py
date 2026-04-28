@@ -86,10 +86,24 @@ class GitHubConfig(BaseModel):
     auto_commit: bool = False
 
 
+class NotionConfig(BaseModel):
+    """Notion integration — planning/task database."""
+    token: Optional[str] = None            # Integration token from notion.so/profile/integrations
+    database_id: Optional[str] = None      # Default database for task creation (optional)
+
+
+class SlackConfig(BaseModel):
+    """Slack integration — completion/failure notifications."""
+    bot_token: Optional[str] = None        # xoxb-... bot token
+    channel: Optional[str] = None          # Default channel to post to (e.g. "#codepilot")
+
+
 class AppConfig(BaseModel):
     """Main application configuration."""
     llm: LLMConfig
     github: GitHubConfig = Field(default_factory=GitHubConfig)
+    notion: NotionConfig = Field(default_factory=NotionConfig)
+    slack: SlackConfig = Field(default_factory=SlackConfig)
     work_dir: Path = Field(default_factory=lambda: Path.home() / "codepilot_projects")
     version: str = "2.0.0"
     created_at: datetime = Field(default_factory=datetime.now)

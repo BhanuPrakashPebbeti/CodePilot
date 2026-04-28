@@ -1,41 +1,41 @@
-"""Build the ADK multi-agent pipeline for CodePilot.
+"""Build the CodePilot ADK multi-agent pipeline.
 
-Pipeline architecture
----------------------
-SequentialAgent (root — "CodePilotPipeline")
-  ├── PlannerAgent       (LlmAgent)
-  ├── DevelopmentLoop    (LoopAgent, configurable max_iterations)
-  │   ├── DeveloperAgent (LlmAgent)
-  │   ├── ReviewAgent    (LlmAgent)
-  │   ├── RuntimeAgent   (LlmAgent)
-  │   ├── TestAgent      (LlmAgent)
-  │   └── DebugAgent     (LlmAgent — can call exit_loop)
-  └── FinalizerAgent     (LlmAgent)
+Refactored architecture
+-----------------------
+All internal capabilities (filesystem, execution, git, testing, etc.) are
+now local Python FunctionTools — no MCP subprocess overhead.
 
-Why SequentialAgent?
---------------------
-The outer pipeline is *deterministic*: planning must complete before
-development begins, and finalisation must happen after the loop ends.
-SequentialAgent is the correct ADK primitive for a fixed-order workflow.
+Only external integrations use MCP:
+  Playwright → browser UI testing
+  GitHub     → repo creation, push, PR (official GitHub MCP)
+  Notion     → plan tracking (official Notion MCP)
+  Slack      → notifications (official Slack MCP)
 
-The alternative — an LlmAgent orchestrator that calls specialist agents
-as ``AgentTool`` sub-agents — is more flexible but less reliable with
-smaller/weaker models because the orchestrator itself must make correct
-routing decisions.  For a coding assistant where the workflow is known
-in advance, SequentialAgent + LoopAgent gives better reliability.
+Agent pipeline
+--------------
+CodePilotPipeline (SequentialAgent)
+  ├── PlannerAgent    (LlmAgent) — understand + plan → Notion
+  ├── DevelopmentLoop (LoopAgent, max_iterations)
+  │   ├── DeveloperAgent  (LlmAgent) — write/edit code
+  │   ├── RuntimeAgent    (LlmAgent) — build, run, verify
+  │   ├── TestAgent       (LlmAgent) — Playwright / HTTP tests
+  │   └── DebugAgent      (LlmAgent) — fix or exit loop (ONLY one with exit_loop)
+  └── FinalizerAgent  (LlmAgent) — README + git + GitHub + Slack
+
+ReviewAgent removed: Developer already self-corrects; Review added latency
+without improving reliability for most errors.
 
 Guardrails (ADK-native callbacks)
 ----------------------------------
-All safety logic is expressed through ADK's callback system:
+before_tool_callback  → compose(guard_tool_loop, confirm_before_destructive_tool)
+before_agent_callback → increment_iteration (LoopAgent only)
+on_tool_error_callback → _handle_tool_error (hallucinated tool names)
 
-  before_tool_callback  → composed chain of:
-                            1. ``guard_tool_loop``               (stuck-loop detection)
-                            2. ``confirm_before_destructive_tool`` (human-in-the-loop, opt-in)
-  before_agent_callback → ``increment_iteration``                (LoopAgent only)
-  on_tool_error_callback → ``_handle_tool_error``               (hallucinated tools)
-
-This is fully ADK-native — no monkey-patching of ADK internals is needed
-for guardrails.  (ADK patches for provider compatibility are in patches.py.)
+Exit-loop enforcement
+---------------------
+Only DebugAgent has access to exit_loop.
+DebugAgent must call check_exit_conditions() first.
+exit_loop itself also logs final_status for audit.
 """
 
 from typing import Optional
@@ -50,24 +50,28 @@ from .callbacks import (
     increment_iteration,
 )
 from .mcp_config import (
-    get_browser_tools,
-    get_debug_tools,
-    get_developer_tools,
-    get_finalizer_tools,
-    get_planner_tools,
-    get_review_tools,
-    get_runtime_tools,
+    get_finalizer_mcp_tools,
+    get_planner_mcp_tools,
+    get_test_mcp_tools,
 )
 from .prompts import (
-    BROWSER_INSTRUCTION,
     DEBUG_INSTRUCTION,
     DEVELOPER_INSTRUCTION,
     FINALIZER_INSTRUCTION,
     PLANNER_INSTRUCTION,
-    REVIEW_INSTRUCTION,
     RUNTIME_INSTRUCTION,
+    TEST_INSTRUCTION,
 )
-from .tools import exit_loop, set_state
+from .tools import (
+    DEBUG_TOOLS,
+    DEVELOPER_TOOLS,
+    FINALIZER_TOOLS,
+    PLANNER_TOOLS,
+    RUNTIME_TOOLS,
+    TEST_TOOLS,
+    exit_loop,
+    set_state,
+)
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -80,50 +84,24 @@ _litellm_registered = False
 # ---------------------------------------------------------------------------
 
 def _register_litellm_providers() -> None:
-    """Register non-Gemini providers with ADK's LLMRegistry via LiteLLM.
-
-    ADK registers openai/, groq/, and anthropic/ by default.  We add the
-    patterns needed for OpenRouter, Ollama, and other providers.
-    """
     global _litellm_registered
     if _litellm_registered:
         return
-
     try:
         from google.adk.models.lite_llm import LiteLlm
     except ImportError:
-        logger.warning(
-            "google.adk.models.lite_llm not found — non-Gemini models will "
-            "not work.  Install with: pip install 'google-adk[extensions]'"
-        )
+        logger.warning("LiteLlm not found — only Gemini models will work")
         return
-
-    patterns = [
-        r"openrouter/.*",
-        r"ollama/.*",
-        r"together_ai/.*",
-        r"deepseek/.*",
-        r"mistral/.*",
-        r"fireworks_ai/.*",
-        r"huggingface/.*",
-        r"cohere/.*",
-        r"replicate/.*",
-        r"bedrock/.*",
-        r"vertex_ai/.*",
-    ]
-    for p in patterns:
-        LLMRegistry._register(p, LiteLlm)
-
+    for pattern in [
+        r"openrouter/.*", r"ollama/.*", r"together_ai/.*",
+        r"deepseek/.*", r"mistral/.*", r"fireworks_ai/.*",
+        r"huggingface/.*", r"cohere/.*", r"bedrock/.*",
+    ]:
+        LLMRegistry._register(pattern, LiteLlm)
     _litellm_registered = True
-    logger.info("LiteLLM providers registered with ADK LLMRegistry")
 
-
-# ---------------------------------------------------------------------------
-# Model string resolution
-# ---------------------------------------------------------------------------
 
 def _resolve_model(provider: str, model: str) -> str:
-    """Convert a CodePilot provider/model pair to an ADK model string."""
     if provider == "gemini":
         return model
     if provider == "ollama":
@@ -134,29 +112,19 @@ def _resolve_model(provider: str, model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool-error callback (hallucinated tool names)
+# Tool-error callback
 # ---------------------------------------------------------------------------
 
 def _handle_tool_error(tool, args: dict, tool_context, error: Exception) -> Optional[dict]:
-    """``on_tool_error_callback`` — catch hallucinated tool names gracefully.
-
-    Without this, ADK raises ValueError and kills the pipeline when the
-    LLM invokes a non-existent tool.  We return a helpful error so the
-    model can self-correct instead.
-    """
     msg = str(error)
     if "not found" in msg.lower():
-        logger.warning("Hallucinated tool '%s' — returning error to model", tool.name)
-        avail = ""
-        if "Available tools:" in msg:
-            avail = msg.split("Available tools:")[1].split("\n")[0].strip()
+        avail = msg.split("Available tools:")[1].split("\n")[0].strip() if "Available tools:" in msg else ""
         return {
             "ok": False,
             "error": (
                 f"Tool '{tool.name}' does not exist. "
-                f"You MUST only call tools that are available to you. "
-                f"Available tools: {avail}. "
-                "Retry with a valid tool name."
+                f"Only call tools listed as available to you. "
+                f"Available: {avail}. Retry with a valid tool name."
             ),
         }
     return None
@@ -171,16 +139,20 @@ def build_codepilot_agent(
     model: str = "mistral",
     api_key: Optional[str] = None,
     github_token: Optional[str] = None,
+    notion_token: Optional[str] = None,
+    slack_token: Optional[str] = None,
     max_iterations: int = 10,
 ) -> SequentialAgent:
-    """Assemble and return the complete CodePilot ADK agent pipeline.
+    """Assemble and return the CodePilot ADK pipeline.
 
     Args:
         provider:       LLM provider — "ollama", "openrouter", or "gemini".
         model:          Model name for the chosen provider.
         api_key:        API key for cloud providers (OpenRouter).
-        github_token:   Optional GitHub token for the GitHub MCP server.
-        max_iterations: Maximum development loop iterations before forced stop.
+        github_token:   GitHub PAT for repo creation and PR (optional).
+        notion_token:   Notion integration token for plan tracking (optional).
+        slack_token:    Slack bot token for notifications (optional).
+        max_iterations: Maximum development loop iterations (default 10).
 
     Returns:
         The root SequentialAgent, ready to run via ``google.adk.runners.Runner``.
@@ -188,95 +160,111 @@ def build_codepilot_agent(
     _register_litellm_providers()
     model_str = _resolve_model(provider, model)
 
-    logger.info("Building CodePilot pipeline: %s/%s (max_iter=%d)", provider, model, max_iterations)
-
-    # Composed before_tool_callback:
-    #   1. Loop guard    — always active
-    #   2. Human-in-loop — only active when CODEPILOT_CONFIRM_DESTRUCTIVE=true
-    tool_guard = compose_before_tool_callbacks(
-        guard_tool_loop,
-        confirm_before_destructive_tool,
+    logger.info(
+        "Building pipeline: %s/%s (max_iter=%d, notion=%s, slack=%s, github=%s)",
+        provider, model, max_iterations,
+        bool(notion_token), bool(slack_token), bool(github_token),
     )
 
-    # ── Shared agent kwargs to avoid repetition ──────────────────────────
+    # Composed before_tool_callback:
+    #   1. Loop guard    — detects stuck loops
+    #   2. Human-in-loop — opt-in destructive confirmation
+    tool_guard = compose_before_tool_callbacks(guard_tool_loop, confirm_before_destructive_tool)
+
     def _agent(**kwargs) -> LlmAgent:
+        kwargs.setdefault("include_contents", "none")
         return LlmAgent(
             model=model_str,
-            include_contents="none",   # each agent works from state, not chat history
             before_tool_callback=tool_guard,
             on_tool_error_callback=_handle_tool_error,
             **kwargs,
         )
 
     # ── 1. Planner ────────────────────────────────────────────────────────
+    # Local tools: project analysis, environment, planning, memory
+    # External MCP (optional): Notion for plan persistence
     planner = _agent(
         name="PlannerAgent",
         instruction=PLANNER_INSTRUCTION,
-        description="Decomposes the user request into a structured development plan.",
-        tools=get_planner_tools(github_token),
+        description="Understands the request, checks memory, creates structured plan, optionally persists to Notion.",
+        tools=[
+            *PLANNER_TOOLS,
+            *get_planner_mcp_tools(notion_token),
+        ],
         output_key="plan_summary",
         include_contents="default",   # planner needs the initial user message
     )
 
     # ── 2a. Developer ─────────────────────────────────────────────────────
+    # Local tools only: fs, exec, git, workspace, env, planning
     developer = _agent(
         name="DeveloperAgent",
         instruction=DEVELOPER_INSTRUCTION,
-        description="Writes code, installs dependencies, scaffolds projects.",
-        tools=get_developer_tools(github_token),
+        description="Writes code, installs dependencies, scaffolds projects, manages git.",
+        tools=DEVELOPER_TOOLS,
         output_key="developer_output",
     )
 
-    # ── 2b. Reviewer ──────────────────────────────────────────────────────
-    reviewer = _agent(
-        name="ReviewAgent",
-        instruction=REVIEW_INSTRUCTION,
-        description="Reviews code for bugs, missing imports, and config issues before runtime.",
-        tools=get_review_tools(),
-        output_key="review_output",
-    )
-
-    # ── 2c. Runtime ───────────────────────────────────────────────────────
+    # ── 2b. Runtime ───────────────────────────────────────────────────────
+    # Local tools only: exec, testing, set_state
     runtime = _agent(
         name="RuntimeAgent",
         instruction=RUNTIME_INSTRUCTION,
-        description="Builds, runs, and verifies projects. Sets app_type/app_ready/app_url state.",
-        tools=[*get_runtime_tools(), set_state],
+        description="Builds, runs, and verifies projects. Sets app_type/app_ready/app_url/runtime_error state.",
+        tools=[*RUNTIME_TOOLS, set_state],
         output_key="runtime_output",
     )
 
-    # ── 2d. Test (Browser) ────────────────────────────────────────────────
+    # ── 2c. Test Agent ────────────────────────────────────────────────────
+    # Local tools: http_request, run_tests
+    # External MCP (optional): Playwright for browser UI testing
     test_agent = _agent(
         name="TestAgent",
-        instruction=BROWSER_INSTRUCTION,
-        description="Browser UI testing for web projects; skips for CLI/library/script.",
-        tools=[*get_browser_tools(), set_state],
-        output_key="browser_output",
+        instruction=TEST_INSTRUCTION,
+        description="Browser UI testing for web projects via Playwright; HTTP tests for APIs; skips for CLI/library.",
+        tools=[
+            *TEST_TOOLS,
+            set_state,
+            *get_test_mcp_tools(),
+        ],
+        output_key="test_output",
     )
 
-    # ── 2e. Debug ─────────────────────────────────────────────────────────
+    # ── 2d. Debug Agent ───────────────────────────────────────────────────
+    # Local tools: debug, fs, exec, memory, validation
+    # ONLY agent with exit_loop — must call check_exit_conditions first
     debug = _agent(
         name="DebugAgent",
         instruction=DEBUG_INSTRUCTION,
-        description="Diagnoses failures, applies fixes, or terminates the loop on success.",
-        tools=[*get_debug_tools(), set_state, exit_loop],
+        description="Diagnoses failures, applies fixes. Calls check_exit_conditions() then exit_loop when done.",
+        tools=[
+            *DEBUG_TOOLS,
+            set_state,
+            exit_loop,       # ONLY the Debug Agent has this
+        ],
         output_key="debug_output",
     )
 
     # ── Development loop ──────────────────────────────────────────────────
     dev_loop = LoopAgent(
         name="DevelopmentLoop",
-        sub_agents=[developer, reviewer, runtime, test_agent, debug],
+        sub_agents=[developer, runtime, test_agent, debug],
         max_iterations=max_iterations,
         before_agent_callback=increment_iteration,
     )
 
     # ── 3. Finalizer ──────────────────────────────────────────────────────
+    # Local tools: fs, git, exec, memory
+    # External MCP (optional): GitHub + Slack + Notion
     finalizer = _agent(
         name="FinalizerAgent",
         instruction=FINALIZER_INSTRUCTION,
-        description="Cleans up, writes README, commits, saves session memory.",
-        tools=get_finalizer_tools(),
+        description="Stops servers, writes README, commits, pushes to GitHub, notifies Slack, saves memory.",
+        tools=[
+            *FINALIZER_TOOLS,
+            set_state,
+            *get_finalizer_mcp_tools(github_token, slack_token, notion_token),
+        ],
         output_key="final_summary",
     )
 
@@ -285,11 +273,11 @@ def build_codepilot_agent(
         name="CodePilotPipeline",
         description=(
             "Autonomous software engineering pipeline: "
-            "Plan → Develop → Review → Run → Test → Fix → Finalize. "
-            "Project-type agnostic: works with web apps, CLIs, libraries, APIs, scripts."
+            "Plan → Develop → Run → Test → Fix → Finalize. "
+            "Language-agnostic: web apps, CLIs, APIs, libraries, scripts."
         ),
         sub_agents=[planner, dev_loop, finalizer],
     )
 
-    logger.info("CodePilot pipeline built successfully")
+    logger.info("Pipeline built — model=%s, agents=Planner+Developer+Runtime+Test+Debug+Finalizer", model_str)
     return root

@@ -1,28 +1,29 @@
 """ADK-based multi-agent architecture for CodePilot.
 
-Pipeline hierarchy
-------------------
+Refactored pipeline
+-------------------
 CodePilotPipeline (SequentialAgent)
-  ├── PlannerAgent       (LlmAgent — checks memory, decomposes task into plan)
-  ├── DevelopmentLoop    (LoopAgent — iterative implement→review→run→test→fix)
-  │   ├── DeveloperAgent (LlmAgent — writes/edits code via MCP filesystem+bash)
-  │   ├── ReviewAgent    (LlmAgent — static review before runtime)
-  │   ├── RuntimeAgent   (LlmAgent — builds, runs, verifies by project type)
-  │   ├── TestAgent      (LlmAgent — browser UI testing for web, skip for others)
-  │   └── DebugAgent     (LlmAgent — searches memory, diagnoses, fixes, exits)
-  └── FinalizerAgent     (LlmAgent — README, git commit, saves session memory)
+  ├── PlannerAgent    (LlmAgent — memory check, plan, optional Notion sync)
+  ├── DevelopmentLoop (LoopAgent — iterative implement→run→test→fix)
+  │   ├── DeveloperAgent  (LlmAgent — writes/edits code, local tools only)
+  │   ├── RuntimeAgent    (LlmAgent — builds, runs, verifies)
+  │   ├── TestAgent       (LlmAgent — Playwright browser + HTTP tests)
+  │   └── DebugAgent      (LlmAgent — fixes, check_exit_conditions, exit_loop)
+  └── FinalizerAgent  (LlmAgent — README, git, GitHub MCP, Slack MCP)
 
-Guardrails (ADK-native callbacks — see callbacks/)
----------------------------------------------------
-before_tool_callback  → guard_tool_loop + confirm_before_destructive_tool
-before_agent_callback → increment_iteration (LoopAgent)
-on_tool_error_callback → hallucinated-tool handler
+Tool classification
+-------------------
+Local FunctionTools  → fs, exec, git, workspace, testing, environment,
+                       planning, memory, debug_tools, validation, state
+External MCP         → Playwright, GitHub (official), Notion (official),
+                       Slack (official)
 
-Memory (see memory/)
---------------------
-SqliteMemoryService   → ADK automatic session persistence (~/.codepilot/session_memory.db)
-memory_server.py      → structured agent memory via MCP (~/.codepilot/memory.db)
+ReviewAgent removed: Developer self-corrects; Review added latency.
 """
+
+# Apply warning suppression BEFORE any google.adk import.
+from .patches import _suppress_third_party_warnings as _suppress
+_suppress()
 
 from .builder import build_codepilot_agent
 from .runner import CodePilotRunner, create_codepilot_runner
@@ -32,6 +33,7 @@ from .prompts import (
     REVIEW_INSTRUCTION,
     RUNTIME_INSTRUCTION,
     BROWSER_INSTRUCTION,
+    TEST_INSTRUCTION,
     DEBUG_INSTRUCTION,
     FINALIZER_INSTRUCTION,
 )
@@ -45,6 +47,7 @@ __all__ = [
     "REVIEW_INSTRUCTION",
     "RUNTIME_INSTRUCTION",
     "BROWSER_INSTRUCTION",
+    "TEST_INSTRUCTION",
     "DEBUG_INSTRUCTION",
     "FINALIZER_INSTRUCTION",
 ]
