@@ -7,7 +7,7 @@ from typing import Optional
 
 from pydantic import ValidationError
 
-from .models import APIKey, AppConfig, GitHubConfig, LLMConfig
+from .models import APIKey, AppConfig, GitHubConfig, LLMConfig, NotionConfig, SlackConfig
 from .keys import APIKeyRotator
 from ..core.exceptions import ConfigurationError
 from ..utils.constants import CONFIG_DIR, CONFIG_FILE, PROVIDER_OPENROUTER
@@ -287,6 +287,63 @@ class ConfigManager:
         
         return self._key_rotator.get_status()
     
+    def update_github(
+        self,
+        token: Optional[str] = None,
+        username: Optional[str] = None,
+        auto_commit: bool = False,
+    ) -> None:
+        """Update GitHub integration config."""
+        if not self._config:
+            raise ConfigurationError("No configuration exists")
+        self._config.github = GitHubConfig(
+            token=token,
+            username=username,
+            auto_commit=auto_commit,
+        )
+        self._save()
+        logger.info("✅ GitHub configuration updated")
+
+    def update_notion(
+        self,
+        token: Optional[str] = None,
+        parent_page_id: Optional[str] = None,
+    ) -> None:
+        """Update Notion integration config.
+
+        Args:
+            token: Notion integration token (secret_xxx).
+            parent_page_id: ID of the Notion page to nest project pages under.
+        """
+        if not self._config:
+            raise ConfigurationError("No configuration exists")
+        self._config.notion = NotionConfig(
+            token=token,
+            parent_page_id=parent_page_id,
+        )
+        self._save()
+        logger.info("✅ Notion configuration updated")
+
+    def update_slack(
+        self,
+        bot_token: Optional[str] = None,
+        channel: Optional[str] = "#codepilot",
+    ) -> None:
+        """Update Slack integration config.
+
+        Args:
+            bot_token: Slack bot token (xoxb-...).
+            channel: Default channel for notifications and HITL.
+        """
+        if not self._config:
+            raise ConfigurationError("No configuration exists")
+        self._config.slack = SlackConfig(
+            bot_token=bot_token,
+            channel=channel,
+        )
+        self._save()
+        logger.info("✅ Slack configuration updated")
+
     def reset(self) -> None:
         """Reset configuration (delete config file)."""
         if self.config_path.exists():

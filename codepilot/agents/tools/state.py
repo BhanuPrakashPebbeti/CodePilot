@@ -13,14 +13,20 @@ from ...utils.logger import get_logger
 logger = get_logger(__name__)
 
 ALLOWED_STATE_KEYS = frozenset({
-    "app_type",       # "web" | "api" | "fullstack" | "cli" | "library" | "script"
-    "app_url",        # primary URL for web/API testing
-    "app_ready",      # "true" when app is built and responding
-    "runtime_error",  # error details from Runtime Agent (empty = no error)
-    "test_result",    # "PASS" | "FAIL: ..." | "SKIP: ..."
-    "test_errors",    # verbose error output from the Test Agent
-    "debug_log",      # summary of what the Debug Agent fixed
-    "final_status",   # "SUCCESS" | "PARTIAL: ..." | "FAILED: ..."
+    # Core pipeline state
+    "app_type",           # "web" | "api" | "fullstack" | "cli" | "library" | "script"
+    "app_url",            # primary URL for web/API testing
+    "app_ready",          # "true" when app is built and responding
+    "runtime_error",      # error details from Runtime Agent (empty = no error)
+    "test_result",        # "PASS" | "FAIL: ..." | "SKIP: ..."
+    "test_errors",        # verbose error output from the Test Agent
+    "debug_log",          # summary of what the Debug Agent fixed
+    "final_status",       # "SUCCESS" | "PARTIAL: ..." | "FAILED: ..."
+    # Traceability & external integrations
+    "notion_project_id",  # Notion page ID for this project (set by PlannerAgent)
+    "github_repo_url",    # GitHub repo URL after creation (set by FinalizerAgent)
+    "hitl_decision",      # Last human-in-the-loop decision, e.g. "1: Retry fixing"
+    "screenshot_paths",   # Comma-separated list of captured screenshot file paths
 })
 
 

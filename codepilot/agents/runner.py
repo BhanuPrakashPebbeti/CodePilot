@@ -13,10 +13,10 @@ Persistence model
 -----------------
 Sessions    → ~/.codepilot/sessions.db  (ADK DatabaseSessionService)
 Memory      → ~/.codepilot/session_memory.db  (SqliteMemoryService — session events)
-Structured  → ~/.codepilot/memory.db          (memory MCP server — typed memories)
+Structured  → ~/.codepilot/memory.db          (local memory tools — typed memories)
 
 The first two are automatic (ADK handles them).  The third requires
-agents to call memory MCP tools (store_memory / get_recent_conversations).
+agents to call memory tools (store_memory / get_recent_conversations).
 """
 
 import asyncio
@@ -24,7 +24,6 @@ import json
 import logging as _logging
 import os
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,6 +31,7 @@ from typing import Any, Optional
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 for _n in ("LiteLLM", "litellm", "LiteLLM Proxy", "LiteLLM Router", "httpx"):
     _logging.getLogger(_n).setLevel(_logging.ERROR)
+
 try:
     import litellm as _litellm
     _litellm.suppress_debug_info = True
@@ -53,8 +53,10 @@ from rich.panel import Panel
 
 from .builder import build_codepilot_agent
 from ..config import ConfigManager
+from ..core.drift import DriftDetector
 from ..core.renderer import Renderer, console
 from ..core.session import SessionManager
+from ..core.workspace import prompt_on_drift
 from ..memory import SqliteMemoryService
 from ..utils.constants import (
     CONFIG_DIR,
@@ -113,12 +115,13 @@ class CodePilotRunner:
     def __init__(
         self,
         config_manager: ConfigManager,
-        project_dir: str = ".",
+        workspace: Path,                       # required — set by select_workspace()
         session_manager: Optional[SessionManager] = None,
         max_iterations: int = 8,
     ) -> None:
         self.config_manager = config_manager
-        self.project_dir = str(Path(project_dir).resolve())
+        self.workspace = workspace.resolve()   # locked workspace — never changes
+        self.project_dir = str(self.workspace) # string alias used by agents
         self.session_manager = session_manager or SessionManager(self.project_dir)
         self.max_iterations = max_iterations
         self.renderer = Renderer()
@@ -130,6 +133,14 @@ class CodePilotRunner:
         self.github_token = cfg.github.token if cfg.github else None
         self.notion_token = cfg.notion.token if cfg.notion else None
         self.slack_token = cfg.slack.bot_token if cfg.slack else None
+
+        # Context drift tracking
+        self._task_history: list[str] = []    # descriptions of completed tasks (oldest first)
+        self._drift_detector = DriftDetector(
+            provider=self.provider,
+            model=self.model,
+            api_key=self.api_key,
+        )
 
         self._configure_env()
 
@@ -150,7 +161,38 @@ class CodePilotRunner:
             os.environ.setdefault("OLLAMA_API_BASE", "http://localhost:11434")
         if self.github_token:
             os.environ["GITHUB_TOKEN"] = self.github_token
+            os.environ["GITHUB_PERSONAL_ACCESS_TOKEN"] = self.github_token
+
+        # Notion local tools read NOTION_TOKEN + NOTION_PARENT_PAGE_ID from env
+        cfg = self.config_manager.config
+        if cfg.notion.token:
+            os.environ.setdefault("NOTION_TOKEN", cfg.notion.token)
+        if cfg.notion.parent_page_id:
+            os.environ.setdefault("NOTION_PARENT_PAGE_ID", cfg.notion.parent_page_id)
+
+        # Slack local tools read SLACK_BOT_TOKEN + SLACK_CHANNEL from env
+        if cfg.slack.bot_token:
+            os.environ.setdefault("SLACK_BOT_TOKEN", cfg.slack.bot_token)
+        if cfg.slack.channel:
+            os.environ.setdefault("SLACK_CHANNEL", cfg.slack.channel)
+
+        # Workspace is locked — set once, never overwritten
         os.environ["CODEPILOT_PROJECT_DIR"] = self.project_dir
+
+    def switch_workspace(self, new_workspace: Path) -> None:
+        """Switch to a new workspace (only triggered from the REPL drift prompt).
+
+        Resets task history so the drift detector re-learns the new project.
+        """
+        self.workspace = new_workspace.resolve()
+        self.project_dir = str(self.workspace)
+        self.session_manager = SessionManager(self.project_dir)
+        self._task_history = []                    # reset — new project starts fresh
+        os.environ["CODEPILOT_PROJECT_DIR"] = self.project_dir
+        console.print(
+            f"\n[green]✓ Workspace switched:[/green] [bold]{self.workspace}[/bold]\n"
+        )
+        logger.info("Workspace switched to: %s", self.workspace)
 
     # ── Stale-state cleanup ───────────────────────────────────────────────
 
@@ -168,8 +210,8 @@ class CodePilotRunner:
     def _load_memory_context(self) -> str:
         """Read recent structured memories for this project.
 
-        Queries the memory MCP server's SQLite database directly (faster
-        than spawning the MCP subprocess just for context loading).
+        Queries the local memory SQLite database directly (faster
+        than going through an MCP subprocess just for context loading).
         Returns a formatted context block, or empty string if no memories.
         """
         try:
@@ -201,7 +243,7 @@ class CodePilotRunner:
     # ── Public run API ────────────────────────────────────────────────────
 
     def run(self, task: str, memory_context: str = "") -> None:
-        """Run a single task through the full pipeline.
+        """Run a single task through the full pipeline against the locked workspace.
 
         Args:
             task:           Natural-language task description.
@@ -215,6 +257,12 @@ class CodePilotRunner:
             console.print(f"\n[red]Pipeline error:[/red] {e}")
             logger.exception("Pipeline execution failed")
             raise
+        finally:
+            # Record task in history regardless of success/failure.
+            # Keep last 10 entries — enough for drift detection, cheap to store.
+            self._task_history.append(task)
+            if len(self._task_history) > 10:
+                self._task_history.pop(0)
 
     async def _run_async(self, task: str, memory_context: str = "") -> None:
         self._cleanup_stale_plan_state()
@@ -268,7 +316,8 @@ class CodePilotRunner:
         console.print(
             Panel(
                 f"[bold cyan]CodePilot Pipeline[/bold cyan]\n"
-                f"[dim]{self.provider}/{self.model}[/dim]",
+                f"[dim]{self.provider}/{self.model}[/dim]\n"
+                f"[dim]📁 {self.workspace}[/dim]",
                 border_style="cyan",
             )
         )
@@ -388,15 +437,15 @@ class CodePilotRunner:
     # ── Interactive REPL ──────────────────────────────────────────────────
 
     def run_interactive(self) -> None:
-        """Interactive REPL — run multiple tasks in one session.
+        """Interactive REPL — run multiple tasks against the locked workspace.
 
         Features
         --------
+        - Locked workspace — all tasks operate on the same project directory
+        - Drift detection — warns when a new task appears unrelated to the project
+        - Memory context injection — loads relevant past sessions automatically
         - Persistent command history (↑/↓ arrows)
-        - Memory context injection: loads recent session summaries and
-          prepends them to each new task so agents have context about
-          what was previously built.
-        - Built-in commands: exit, clear, history, help, memory
+        - Built-in commands: workspace, memory, clear, history, help, exit
         """
         import readline
         import atexit
@@ -411,9 +460,10 @@ class CodePilotRunner:
 
         console.print(
             Panel(
-                "[bold cyan]CodePilot Interactive Mode[/bold cyan]\n"
-                f"[dim]{self.provider}/{self.model} · "
-                "Type 'help' for commands or 'exit' to quit[/dim]",
+                "[bold cyan]CodePilot — Interactive Mode[/bold cyan]\n"
+                f"[dim]{self.provider}/{self.model}[/dim]\n"
+                f"[dim]📁 Workspace: {self.workspace}[/dim]\n"
+                "[dim]Type 'help' for commands · 'exit' to quit[/dim]",
                 border_style="cyan",
             )
         )
@@ -425,29 +475,52 @@ class CodePilotRunner:
                     continue
 
                 # ── Built-in commands ─────────────────────────────────────
-                if task.lower() in ("exit", "quit", "q"):
+                cmd = task.lower()
+                if cmd in ("exit", "quit", "q"):
                     console.print("[dim]Goodbye![/dim]")
                     break
-                if task.lower() == "clear":
+                if cmd == "clear":
                     os.system("clear" if os.name != "nt" else "cls")
                     continue
-                if task.lower() == "history":
+                if cmd == "history":
                     n = readline.get_current_history_length()
                     for i in range(1, n + 1):
                         console.print(f"  {i}: {readline.get_history_item(i)}")
                     continue
-                if task.lower() in ("help", "?"):
+                if cmd in ("help", "?"):
                     self._show_help()
                     continue
-                if task.lower() == "memory":
+                if cmd == "memory":
                     self._show_memory()
                     continue
+                if cmd == "workspace":
+                    console.print(
+                        f"[cyan]Locked workspace:[/cyan] [bold]{self.workspace}[/bold]"
+                    )
+                    continue
+
+                # ── Agentic context-drift check ───────────────────────────
+                if self._task_history:
+                    console.print("[dim]Checking context…[/dim]", end="\r")
+                    drift = self._drift_detector.check(self._task_history, task)
+                    console.print(" " * 25, end="\r")   # clear the "Checking" line
+
+                    if drift:
+                        history_summary = " → ".join(self._task_history[-3:])
+                        proceed, new_ws = prompt_on_drift(
+                            self.workspace, history_summary, task
+                        )
+                        if not proceed:
+                            console.print("[dim]Request cancelled.[/dim]")
+                            continue
+                        if new_ws:
+                            self.switch_workspace(new_ws)
 
                 # ── Load memory context ───────────────────────────────────
                 memory_ctx = self._load_memory_context()
                 if memory_ctx:
                     console.print(
-                        "[dim]↳ Loaded memory context from previous sessions[/dim]"
+                        "[dim]↳ Memory context loaded from previous sessions[/dim]"
                     )
 
                 self.run(task, memory_context=memory_ctx)
@@ -473,13 +546,19 @@ class CodePilotRunner:
         console.print(
             Panel(
                 "[bold]Commands:[/bold]\n"
-                "  [cyan]<task>[/cyan]    — Execute a development task\n"
-                "  [cyan]memory[/cyan]   — Show memory from previous sessions\n"
-                "  [cyan]clear[/cyan]    — Clear the terminal\n"
-                "  [cyan]history[/cyan]  — Show command history\n"
-                "  [cyan]help[/cyan]     — Show this help\n"
-                "  [cyan]exit[/cyan]     — End the session\n"
-                "  [cyan]↑/↓[/cyan]      — Navigate previous commands\n\n"
+                "  [cyan]<task>[/cyan]       — Run a development task in the locked workspace\n"
+                "  [cyan]workspace[/cyan]    — Show the locked workspace path\n"
+                "  [cyan]memory[/cyan]       — Show memory from previous sessions\n"
+                "  [cyan]clear[/cyan]        — Clear the terminal\n"
+                "  [cyan]history[/cyan]      — Show command history\n"
+                "  [cyan]help[/cyan]         — Show this help\n"
+                "  [cyan]exit[/cyan]         — End the session\n"
+                "  [cyan]↑/↓[/cyan]          — Navigate previous commands\n\n"
+                "[bold]Workspace rules:[/bold]\n"
+                "  • All file operations are confined to the locked workspace\n"
+                "  • Paths outside the workspace are automatically rejected\n"
+                "  • If your request seems unrelated to the current project,\n"
+                "    CodePilot will ask before switching workspaces\n\n"
                 "[bold]Examples:[/bold]\n"
                 '  "Create a REST API with Flask and PostgreSQL"\n'
                 '  "Build a CLI tool that converts CSV to JSON"\n'
@@ -500,11 +579,11 @@ class CodePilotRunner:
 
 def create_codepilot_runner(
     config_manager: ConfigManager,
-    project_dir: str = ".",
+    workspace: Path,
     session_manager: Optional[SessionManager] = None,
 ) -> CodePilotRunner:
     return CodePilotRunner(
         config_manager=config_manager,
-        project_dir=project_dir,
+        workspace=workspace,
         session_manager=session_manager,
     )

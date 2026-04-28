@@ -87,15 +87,25 @@ class GitHubConfig(BaseModel):
 
 
 class NotionConfig(BaseModel):
-    """Notion integration — planning/task database."""
-    token: Optional[str] = None            # Integration token from notion.so/profile/integrations
-    database_id: Optional[str] = None      # Default database for task creation (optional)
+    """Notion integration — multi-project lifecycle tracking.
+
+    Required env vars (read directly by notion_tools.py):
+      NOTION_TOKEN            — integration token from notion.so/profile/integrations
+      NOTION_PARENT_PAGE_ID   — Notion page ID to nest project pages under
+    """
+    token: Optional[str] = None            # Integration token (also set as NOTION_TOKEN env var)
+    parent_page_id: Optional[str] = None   # Page ID to create project pages under
 
 
 class SlackConfig(BaseModel):
-    """Slack integration — completion/failure notifications."""
-    bot_token: Optional[str] = None        # xoxb-... bot token
-    channel: Optional[str] = None          # Default channel to post to (e.g. "#codepilot")
+    """Slack integration — notifications and HITL decisions.
+
+    Required env vars (read directly by slack_hitl.py):
+      SLACK_BOT_TOKEN — xoxb-... bot token
+      SLACK_CHANNEL   — channel to post to (e.g. "#codepilot")
+    """
+    bot_token: Optional[str] = None        # xoxb-... bot token (also set as SLACK_BOT_TOKEN)
+    channel: Optional[str] = "#codepilot"  # Default channel for notifications and HITL
 
 
 class AppConfig(BaseModel):

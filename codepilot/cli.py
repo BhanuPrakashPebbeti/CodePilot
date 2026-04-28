@@ -1,7 +1,6 @@
 """Clean CLI interface for CodePilot."""
 
 import sys
-from pathlib import Path
 from typing import Optional
 
 import typer
@@ -10,9 +9,10 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .config import ConfigManager
-from .agents import create_codepilot_runner, CodePilotRunner
+from .agents import create_codepilot_runner
 from .core.exceptions import CodePilotError, ConfigurationError
 from .core.session import SessionManager
+from .core.workspace import select_workspace
 from .utils import console, enable_debug_mode, get_logger
 from .utils.constants import (
     APP_NAME,
@@ -142,34 +142,55 @@ def interactive_config_setup() -> bool:
         else:
             model = models[model_choice]
     
-    # Optional GitHub token
-    console.print("\n[cyan]GitHub Integration (Optional):[/cyan]")
-    console.print("[dim]Only needed if you want CodePilot to push code to GitHub[/dim]")
-    console.print("[dim]Local git commands will work without this[/dim]\n")
-    
+    # Optional integrations
+    console.print("\n[cyan]Optional Integrations:[/cyan]")
+    console.print("[dim]These enable GitHub push, Notion planning, and Slack notifications.[/dim]")
+    console.print("[dim]All are optional — CodePilot works fully without them.[/dim]\n")
+
     if Confirm.ask("Configure GitHub token?", default=False):
-        github_token = Prompt.ask("Enter your GitHub token", password=True)
-    
+        console.print("[dim]Needed for: push code to GitHub, create repos, open PRs[/dim]")
+        github_token = Prompt.ask("Enter your GitHub personal access token", password=True)
+
+    notion_token = None
+    notion_parent_page_id = None
+    if Confirm.ask("Configure Notion token?", default=False):
+        console.print("[dim]Needed for: project pages, task tracking, execution logs in Notion[/dim]")
+        console.print("[dim]Get integration token at: https://www.notion.so/profile/integrations[/dim]")
+        notion_token = Prompt.ask("Enter your Notion integration token (secret_xxx)", password=True)
+        console.print("[dim]Parent page ID: open a Notion page → Copy link → extract the ID (32-char hex)[/dim]")
+        notion_parent_page_id = Prompt.ask(
+            "Enter parent Notion page ID (leave blank to configure later)",
+            default=""
+        ) or None
+
+    slack_token = None
+    slack_channel = None
+    if Confirm.ask("Configure Slack notifications?", default=False):
+        console.print("[dim]Needed for: failure alerts, human-in-the-loop decisions[/dim]")
+        console.print("[dim]Required bot scopes: chat:write, channels:history, channels:read[/dim]")
+        slack_token = Prompt.ask("Enter your Slack bot token (xoxb-...)", password=True)
+        slack_channel = Prompt.ask("Default channel for notifications", default="#codepilot")
+
     # Create configuration
     try:
-        # Prepare kwargs
         create_kwargs = {}
         if provider == PROVIDER_OPENROUTER and 'api_key_kwargs' in locals():
             create_kwargs.update(api_key_kwargs)
-        
+
         config_mgr.create(
             provider=provider,
             model=model,
             api_key=api_key,
             **create_kwargs
         )
-        
-        # Set GitHub token if provided
+
         if github_token:
-            config = config_mgr.config
-            config.github.token = github_token
-            config_mgr._save()
-        
+            config_mgr.update_github(github_token)
+        if notion_token:
+            config_mgr.update_notion(notion_token, notion_parent_page_id)
+        if slack_token:
+            config_mgr.update_slack(slack_token, slack_channel)
+
         console.print("\n[green]✓ Configuration created successfully![/green]")
         return True
     except Exception as e:
@@ -183,62 +204,57 @@ def interactive_config_setup() -> bool:
 
 @app.command(name="run")
 def run_command(
-    task: Optional[str] = typer.Argument(None, help="Task to execute (omit for interactive mode)"),
-    project: str = typer.Option(".", "--project", "-p", help="Project directory"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode"),
 ) -> None:
-    """Execute a task or start interactive session.
-    
-    Examples:
-        codepilot run                              # Interactive mode
-        codepilot run "create a hello world app"   # Single task
-        codepilot run "build API" --project ./api  # Specific project
+    """Start an interactive CodePilot session.
+
+    Workspace is selected interactively at session start and locked for the
+    entire session.  All agent operations are confined to that directory.
+
+    Example:
+        codepilot run
+        codepilot run --debug
     """
     if debug:
         enable_debug_mode()
-    
+
     try:
-        # Show banner
         show_banner()
-        
-        # Load configuration or create if missing
+
+        # Load or create configuration
         config_manager = ConfigManager()
         if not config_manager.exists:
             if not interactive_config_setup():
                 raise typer.Exit(1)
-        
-        # Display provider/model info
+
         config = config_manager.config
         provider = config.llm.active_provider
         model = config.llm.active_model
-        console.print(f"[dim]Provider: {provider} | Model: {model}[/dim]\n")
-        
-        # Create agent
-        runner = create_codepilot_runner(config_manager, project)
-        
-        # Execute task or start interactive
-        if task:
-            console.print(f"\n[cyan]Executing:[/cyan] {task}\n")
-            runner.run(task)
-            console.print("\n[green]✅ Done[/green]")
-        else:
-            console.print("\n[dim]Type 'exit' or 'quit' to end session[/dim]\n")
-            runner.run_interactive()
-    
+        console.print(f"[dim]Provider: {provider} | Model: {model}[/dim]")
+
+        # Mandatory workspace selection — locked for entire session
+        workspace = select_workspace()
+
+        runner = create_codepilot_runner(config_manager, workspace)
+        runner.run_interactive()
+
     except ConfigurationError as e:
         console.print(f"[red]Configuration error:[/red] {e}")
         raise typer.Exit(1)
-    
+
     except CodePilotError as e:
         console.print(f"[red]Error:[/red] {e}")
         if debug:
             raise
         raise typer.Exit(1)
-    
+
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted[/yellow]")
         raise typer.Exit(0)
-    
+
+    except SystemExit:
+        raise typer.Exit(0)
+
     except Exception as e:
         console.print(f"[red]Unexpected error:[/red] {e}")
         if debug:
@@ -278,50 +294,54 @@ def config_init() -> None:
                 console.print("[bold cyan]What would you like to do?[/bold cyan]")
                 console.print("  1. Update OpenRouter configuration")
                 console.print("  2. Update Ollama configuration")
-                console.print("  3. Update GitHub token (optional)")
-                console.print("  4. Set provider preference")
-                console.print("  5. Manage OpenRouter models")
-                console.print("  6. Reset to defaults")
-                console.print("  7. Delete configuration")
-                console.print("  8. Exit")
-                
+                console.print("  3. Update GitHub token")
+                console.print("  4. Update Notion token")
+                console.print("  5. Update Slack token")
+                console.print("  6. Set provider preference")
+                console.print("  7. Manage OpenRouter models")
+                console.print("  8. Reset to defaults")
+                console.print("  9. Delete configuration")
+                console.print("  10. Exit")
+
                 choice = Prompt.ask(
                     "Select option",
-                    choices=["1", "2", "3", "4", "5", "6", "7", "8"],
-                    default="8"
+                    choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+                    default="10"
                 )
-                
-                if choice == "8":
+
+                if choice == "10":
                     console.print("\n[green]Configuration saved![/green]")
                     return
-                elif choice == "7":
+                elif choice == "9":
                     if Confirm.ask("Are you sure you want to delete the configuration?", default=False):
                         config_manager.config_path.unlink()
                         console.print("[green]✓ Configuration deleted[/green]")
                     return
-                elif choice == "6":
+                elif choice == "8":
                     if Confirm.ask("Reset configuration to defaults?", default=False):
                         config_manager.config_path.unlink()
                         config_manager.create(provider=PROVIDER_OLLAMA, model=OLLAMA_DEFAULT_MODEL)
                         console.print("[green]✓ Configuration reset to defaults (Ollama/mistral)[/green]")
                     return
-                elif choice == "5":
-                    # Manage OpenRouter models
+                elif choice == "7":
                     _manage_models(config_manager)
-                    console.print()  # Empty line for spacing
-                elif choice == "4":
-                    # Set provider preference
+                    console.print()
+                elif choice == "6":
                     _update_provider_preference(config_manager)
-                    console.print()  # Empty line for spacing
+                    console.print()
+                elif choice == "5":
+                    _update_slack_token(config_manager)
+                    console.print()
+                elif choice == "4":
+                    _update_notion_token(config_manager)
+                    console.print()
                 elif choice == "3":
-                    # Update GitHub token
                     _update_github_token(config_manager)
-                    console.print()  # Empty line for spacing
+                    console.print()
                 elif choice in ["1", "2"]:
-                    # Update provider configuration
                     provider = PROVIDER_OPENROUTER if choice == "1" else PROVIDER_OLLAMA
                     _update_provider_config(config_manager, provider)
-                    console.print()  # Empty line for spacing
+                    console.print()
         else:
             # New configuration
             interactive_config_setup()
@@ -413,16 +433,59 @@ def _update_provider_config(config_manager: ConfigManager, provider: str) -> Non
 
 def _update_github_token(config_manager: ConfigManager) -> None:
     """Update GitHub token configuration."""
-    config = config_manager.config
-    if Confirm.ask("Set GitHub token?", default=True):
-        token = Prompt.ask("Enter GitHub token", password=True)
-        config.github.token = token
-        config_manager._save()
+    current = config_manager.config.github.token
+    status = "● set" if current else "not set"
+    console.print(f"\n[cyan]GitHub Token[/cyan] [dim]({status})[/dim]")
+    console.print("[dim]Used for: push code, create repos, open PRs[/dim]")
+    console.print("[dim]Get it at: https://github.com/settings/tokens[/dim]\n")
+    if Confirm.ask("Set a new GitHub token?", default=not bool(current)):
+        token = Prompt.ask("Enter GitHub personal access token", password=True)
+        config_manager.update_github(token)
         console.print("[green]✓ GitHub token updated[/green]")
-    else:
-        config.github.token = None
-        config_manager._save()
-        console.print("[green]✓ GitHub token removed[/green]")
+    elif current and Confirm.ask("Clear existing GitHub token?", default=False):
+        config_manager.update_github(None)
+        console.print("[green]✓ GitHub token cleared[/green]")
+
+
+def _update_notion_token(config_manager: ConfigManager) -> None:
+    """Update Notion integration token and parent page ID."""
+    current = config_manager.config.notion.token
+    current_page = config_manager.config.notion.parent_page_id
+    status = "● set" if current else "not set"
+    console.print(f"\n[cyan]Notion Integration[/cyan] [dim]({status})[/dim]")
+    console.print("[dim]Used for: project pages, task tracking, execution logs[/dim]")
+    console.print("[dim]Token: https://www.notion.so/profile/integrations[/dim]\n")
+    if Confirm.ask("Set a new Notion token?", default=not bool(current)):
+        token = Prompt.ask("Enter Notion integration token (secret_xxx)", password=True)
+        console.print("[dim]Parent page ID: open a Notion page → Copy link → extract 32-char hex ID[/dim]")
+        page_id = Prompt.ask(
+            "Enter parent Notion page ID (where project pages will be created)",
+            default=current_page or ""
+        )
+        config_manager.update_notion(token, page_id or None)
+        console.print("[green]✓ Notion token updated[/green]")
+    elif current and Confirm.ask("Clear existing Notion token?", default=False):
+        config_manager.update_notion(None)
+        console.print("[green]✓ Notion token cleared[/green]")
+
+
+def _update_slack_token(config_manager: ConfigManager) -> None:
+    """Update Slack bot token and channel."""
+    current = config_manager.config.slack.bot_token
+    current_ch = config_manager.config.slack.channel or "#codepilot"
+    status = "● set" if current else "not set"
+    console.print(f"\n[cyan]Slack Bot Token[/cyan] [dim]({status})[/dim]")
+    console.print("[dim]Used for: completion notifications, failure alerts, user input[/dim]")
+    console.print("[dim]Create a bot at: https://api.slack.com/apps[/dim]")
+    console.print("[dim]Required scopes: chat:write, channels:read[/dim]\n")
+    if Confirm.ask("Set a new Slack token?", default=not bool(current)):
+        token = Prompt.ask("Enter Slack bot token (xoxb-...)", password=True)
+        channel = Prompt.ask("Default channel", default=current_ch)
+        config_manager.update_slack(token, channel)
+        console.print("[green]✓ Slack token updated[/green]")
+    elif current and Confirm.ask("Clear existing Slack token?", default=False):
+        config_manager.update_slack(None)
+        console.print("[green]✓ Slack token cleared[/green]")
 
 
 def _manage_models(config_manager: ConfigManager) -> None:
@@ -571,9 +634,20 @@ def config_show() -> None:
         
         table.add_row("Work Directory", str(config.work_dir))
         table.add_row("Config File", str(CONFIG_FILE))
-        
+
+        # Integration tokens (show status only, never the raw value)
+        gh_status = "[green]✓ Configured[/green]" if config.github.token else "[dim]Not set[/dim]"
+        notion_status = "[green]✓ Configured[/green]" if config.notion.token else "[dim]Not set[/dim]"
+        slack_status = (
+            f"[green]✓ Configured[/green] → {config.slack.channel or '#codepilot'}"
+            if config.slack.bot_token else "[dim]Not set[/dim]"
+        )
+        table.add_row("GitHub Token", gh_status)
+        table.add_row("Notion Token", notion_status)
+        table.add_row("Slack Token", slack_status)
+
         console.print(table)
-        
+
         # Show rotator status if multiple keys
         if config.llm.has_multiple_keys:
             status = config_manager.get_rotator_status()
@@ -794,7 +868,7 @@ def version_command() -> None:
 def info_command() -> None:
     """Show installation and paths."""
     from . import __version__
-    from .utils.constants import CONFIG_DIR, LOGS_DIR, SESSIONS_DIR
+    from .utils.constants import LOGS_DIR, SESSIONS_DIR
     
     console.print(Panel(f"[bold cyan]{APP_NAME} v{__version__}[/bold cyan]\n{APP_TAGLINE}"))
     
