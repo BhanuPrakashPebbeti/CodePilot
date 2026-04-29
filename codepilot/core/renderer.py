@@ -579,28 +579,37 @@ class Renderer:
     # ------------------------------------------------------------------
 
     def _render_bash_output(self, tool_name: str, parsed: Optional[dict], raw: str) -> None:
-        """Render bash/command output: show stdout/stderr cleanly."""
+        """Render bash/command output: show stdout/stderr cleanly.
+
+        Local exec tools return stdout/stderr at the top level of the dict.
+        The nested 'data' format is a legacy fallback kept for compatibility.
+        """
         if not parsed:
             self._render_raw_fallback(raw)
             return
 
         ok = parsed.get("ok", False)
+
+        # Local tools (exec.py) return stdout/stderr at the top level.
+        # Legacy structured format nests them inside a 'data' dict.
         data = parsed.get("data", {})
-        stdout = stderr = ""
-        if isinstance(data, dict):
+        if isinstance(data, dict) and (data.get("stdout") or data.get("stderr")):
             stdout = data.get("stdout", "") or data.get("output", "") or ""
             stderr = data.get("stderr", "") or ""
-        elif isinstance(data, str):
-            stdout = data
+        else:
+            stdout = parsed.get("stdout", "") or parsed.get("output", "") or parsed.get("tail", "") or ""
+            stderr = parsed.get("stderr", "") or ""
 
         msg = str(parsed.get("message", ""))
-        err = str(parsed.get("error", ""))
+        err = str(parsed.get("error", "")) or stderr.strip()
 
         if ok:
-            status = msg or "Done"
+            # Prefer a short stdout summary over a generic "Done"
+            short_out = stdout.strip().split("\n")[0][:100] if stdout.strip() else ""
+            status = msg or short_out or "Done"
             console.print(f"     [green]✓ {escape(status[:120])}[/green]", highlight=False)
         else:
-            status = err or "Failed"
+            status = err or msg or "Failed"
             console.print(f"     [red]✗ {escape(status[:150])}[/red]", highlight=False)
 
         # Show stdout (truncated to 30 lines)
@@ -612,8 +621,8 @@ class Renderer:
             if len(lines) > max_show:
                 console.print(f"     [dim]│ … {len(lines) - max_show} more lines[/dim]", highlight=False)
 
-        # Show stderr
-        if stderr and stderr.strip() and not ok:
+        # Show stderr on failure (already shown in status line if short)
+        if stderr and stderr.strip() and not ok and stderr.strip() != status:
             for line in stderr.strip().split("\n")[:15]:
                 console.print(f"     [red dim]│ {escape(line[:200])}[/red dim]", highlight=False)
 
@@ -622,8 +631,14 @@ class Renderer:
             self._render_raw_fallback(raw)
             return
         if parsed.get("ok"):
-            msg = str(parsed.get("message", "Done"))
-            console.print(f"     [green]✓ {escape(msg[:120])}[/green]", highlight=False)
+            # write_file returns bytes_written; replace_in_file returns replacements
+            if "bytes_written" in parsed:
+                msg = f"Written ({parsed['bytes_written']} bytes)"
+            elif "replacements" in parsed:
+                msg = f"Replaced {parsed['replacements']} occurrence(s)"
+            else:
+                msg = parsed.get("message", "Done")
+            console.print(f"     [green]✓ {escape(str(msg)[:120])}[/green]", highlight=False)
         else:
             err = str(parsed.get("error", "Failed"))
             console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
@@ -634,33 +649,34 @@ class Renderer:
             return
 
         ok = parsed.get("ok", False)
-        data = parsed.get("data", {})
         msg = str(parsed.get("message", ""))
 
         if ok:
             console.print(f"     [green]✓ {escape(msg or 'Passed')}[/green]", highlight=False)
         else:
-            err = str(parsed.get("error", "Failed"))
+            err = str(parsed.get("error", "")) or msg or "Failed"
             console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
 
-        # For test runners, show summary + output
+        # run_tests returns passed/failed counts and output at the top level
+        passed = parsed.get("passed", 0)
+        failed = parsed.get("failed", 0)
+        if passed or failed:
+            parts = []
+            if passed:
+                parts.append(f"[green]{passed} passed[/green]")
+            if failed:
+                parts.append(f"[red]{failed} failed[/red]")
+            console.print(f"     [dim]│[/dim] {' · '.join(parts)}", highlight=False)
+
+        # Show test output on failure
+        output = parsed.get("output", "")
+        if output and not ok:
+            for line in output.strip().split("\n")[:20]:
+                console.print(f"     [dim]│[/dim] {escape(line[:200])}", highlight=False)
+
+        # Detailed errors (legacy nested format)
+        data = parsed.get("data", {})
         if isinstance(data, dict):
-            summary = data.get("summary", {})
-            if summary:
-                parts = []
-                if summary.get("passed"):  parts.append(f"[green]{summary['passed']} passed[/green]")
-                if summary.get("failed"):  parts.append(f"[red]{summary['failed']} failed[/red]")
-                if summary.get("errors"):  parts.append(f"[red]{summary['errors']} errors[/red]")
-                if parts:
-                    console.print(f"     [dim]│[/dim] {' · '.join(parts)}", highlight=False)
-
-            # Show stdout for failures
-            stdout = data.get("stdout", "")
-            if stdout and not ok:
-                for line in stdout.strip().split("\n")[:20]:
-                    console.print(f"     [dim]│[/dim] {escape(line[:200])}", highlight=False)
-
-            # Detailed errors
             errors = data.get("errors", "")
             if errors and isinstance(errors, str):
                 console.print(f"     [red dim]  {escape(errors[:200])}[/red dim]", highlight=False)
@@ -711,11 +727,13 @@ class Renderer:
             self._render_raw_fallback(raw)
             return
         if parsed.get("ok"):
-            msg = str(parsed.get("message", "Done"))
-            console.print(f"     [green]✓ {escape(msg[:120])}[/green]", highlight=False)
+            # git tools return stdout at top level (no 'message' key)
+            stdout = parsed.get("stdout", "") or parsed.get("message", "")
+            msg = stdout.strip().split("\n")[0][:120] if stdout.strip() else "Done"
+            console.print(f"     [green]✓ {escape(msg)}[/green]", highlight=False)
         else:
-            err = str(parsed.get("error", "Failed"))
-            console.print(f"     [red]✗ {escape(err[:120])}[/red]", highlight=False)
+            err = parsed.get("stderr", "") or parsed.get("error", "Failed")
+            console.print(f"     [red]✗ {escape(str(err)[:120])}[/red]", highlight=False)
 
     def _render_task_result(self, tool_name: str, parsed: Optional[dict], raw: str) -> None:
         """Render planning/task tool results with task list display."""

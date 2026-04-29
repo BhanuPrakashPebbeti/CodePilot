@@ -1,5 +1,6 @@
-"""Local git tools — replaces git_server.py MCP."""
+"""Local git tools for CodePilot — filesystem-level version control."""
 
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -12,6 +13,23 @@ def _git(args: str, cwd: Path) -> dict:
     r = subprocess.run(
         f"git {args}", shell=True, cwd=str(cwd),
         capture_output=True, text=True, env=_clean_env(),
+    )
+    return {"ok": r.returncode == 0, "stdout": r.stdout.strip(), "stderr": r.stderr.strip()}
+
+
+def _git_commit(message: str, cwd: Path, stage_all: bool = False) -> dict:
+    """Run git commit safely — message passed as a list arg, never shell-interpolated."""
+    if stage_all:
+        add_r = subprocess.run(
+            ["git", "add", "-A"], cwd=str(cwd),
+            capture_output=True, text=True, env=_clean_env(),
+        )
+        if add_r.returncode != 0:
+            return {"ok": False, "stdout": "", "stderr": add_r.stderr.strip()}
+
+    r = subprocess.run(
+        ["git", "commit", "-m", message],
+        cwd=str(cwd), capture_output=True, text=True, env=_clean_env(),
     )
     return {"ok": r.returncode == 0, "stdout": r.stdout.strip(), "stderr": r.stderr.strip()}
 
@@ -57,28 +75,26 @@ def git_commit(message: str, tool_context: ToolContext, cwd: str = ".") -> dict:
     """Create a commit with staged changes.
 
     Args:
-        message: Commit message.
+        message: Commit message (any content — safely passed as argv, not shell-interpolated).
         cwd: Repository directory.
 
     Returns:
         dict with ok and stdout.
     """
-    return _git(f'commit -m "{message}"', _resolve_cwd(cwd, tool_context))
+    return _git_commit(message, _resolve_cwd(cwd, tool_context), stage_all=False)
 
 
 def git_commit_all(message: str, tool_context: ToolContext, cwd: str = ".") -> dict:
     """Stage all changes and create a commit.
 
     Args:
-        message: Commit message.
+        message: Commit message (any content — safely passed as argv, not shell-interpolated).
         cwd: Repository directory.
 
     Returns:
         dict with ok and stdout.
     """
-    p = _resolve_cwd(cwd, tool_context)
-    _git("add -A", p)
-    return _git(f'commit -m "{message}"', p)
+    return _git_commit(message, _resolve_cwd(cwd, tool_context), stage_all=True)
 
 
 def git_log(tool_context: ToolContext, cwd: str = ".", n: int = 10) -> dict:

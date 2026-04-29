@@ -13,12 +13,18 @@ HITL flow:
   4. If Slack is not configured at all, returns choice 1 immediately so
      the pipeline continues deterministically.
 
+Channel validation:
+  Before posting, the bot verifies it is a member of the target channel.
+  If not, it logs a clear error (instead of a cryptic API error) and falls
+  back gracefully without crashing the pipeline.
+
 Requires: slack-sdk>=3.0.0  (pip install slack-sdk)
 Env vars: SLACK_BOT_TOKEN (xoxb-...), SLACK_CHANNEL (e.g. "#codepilot")
 """
 
 import os
 import time
+from typing import Optional
 
 from ...utils.logger import get_logger
 
@@ -50,6 +56,52 @@ def _skipped() -> dict:
     return {"ok": True, "skipped": True, "reason": "Slack not configured"}
 
 
+def _resolve_channel_id(client, channel_name: str) -> Optional[str]:
+    """Resolve a channel name like '#codepilot' to a channel ID.
+
+    Returns the channel ID string, or None if not found / not accessible.
+    The lookup is best-effort — failures are logged but never crash the pipeline.
+    """
+    try:
+        name = channel_name.lstrip("#")
+        for page in client.conversations_list(types="public_channel,private_channel", limit=200):
+            for ch in page.get("channels", []):
+                if ch.get("name") == name:
+                    return ch.get("id")
+    except Exception as exc:
+        logger.debug("Could not resolve channel '%s': %s", channel_name, exc)
+    return None
+
+
+def _ensure_bot_in_channel(client, channel: str) -> bool:
+    """Return True if the bot is a member of *channel* (name or ID).
+
+    Attempts to join public channels automatically. For private channels the
+    bot must be manually invited. Returns False and logs clearly on failure.
+    """
+    try:
+        # Try to get channel info — works if bot is already a member
+        resp = client.conversations_info(channel=channel)
+        ch = resp.get("channel", {})
+        if ch.get("is_member"):
+            return True
+        # Not a member — try to join (only works for public channels)
+        if not ch.get("is_private", True):
+            client.conversations_join(channel=channel)
+            logger.info("Bot joined public channel '%s'", channel)
+            return True
+        logger.warning(
+            "Bot is NOT in private channel '%s'. "
+            "Please invite the bot manually: /invite @<bot-name>",
+            channel,
+        )
+        return False
+    except Exception as exc:
+        logger.warning("Channel membership check failed for '%s': %s", channel, exc)
+        # Proceed optimistically — the send will fail with a clearer error if blocked.
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Public tools
 # ---------------------------------------------------------------------------
@@ -62,11 +114,13 @@ def slack_notify(
 
     Supports Slack markdown (*bold*, `code`, _italic_).
     Safe to call even if Slack is not configured — returns skipped=True.
+    Verifies bot channel membership before posting and logs clearly on failure.
 
     Common use cases:
-      - Task started / completed
-      - Build failed / recovered
-      - Pipeline completed or partially completed
+      - 🚀 Pipeline started
+      - ✅ Task / pipeline completed
+      - ⚠️ Build failed / error detected
+      - 🔧 Fix applied
       - GitHub PR created (include URL)
 
     Args:
@@ -77,18 +131,23 @@ def slack_notify(
     Returns:
         {"ok": True, "ts": str, "channel": str}
         or {"ok": True, "skipped": True} if Slack is not configured.
+        or {"ok": False, "error": str} on API failure.
     """
     client = _client()
     if not client:
         return _skipped()
 
     ch = channel or _channel()
+    _ensure_bot_in_channel(client, ch)
+
     try:
         resp = client.chat_postMessage(channel=ch, text=message, mrkdwn=True)
         logger.info("Slack notification sent to %s", ch)
         return {"ok": True, "ts": resp.get("ts", ""), "channel": ch}
     except Exception as exc:
-        logger.warning("slack_notify failed: %s", exc)
+        logger.warning(
+            "slack_notify failed for channel '%s': %s — pipeline continues without Slack", ch, exc
+        )
         return {"ok": False, "error": str(exc)}
 
 
@@ -110,7 +169,7 @@ def slack_ask_human(
       2. Polls for a reply containing "1", "2", etc. every 10 seconds.
       3. If no reply within timeout_seconds, defaults to choice 1 (safest)
          and posts a timeout notice.
-      4. If Slack is not configured, returns choice 1 immediately.
+      4. If Slack is not configured or unreachable, returns choice 1 immediately.
 
     Agents should always resume after this call regardless of the source
     (slack / timeout_default / not_configured).
@@ -147,6 +206,10 @@ def slack_ask_human(
         return {"choice": 1, "option_text": options[0], "source": "not_configured"}
 
     ch = channel or _channel()
+
+    if not _ensure_bot_in_channel(client, ch):
+        logger.warning("HITL skipped — bot not in channel '%s'. Defaulting to choice 1.", ch)
+        return {"choice": 1, "option_text": options[0], "source": "not_configured"}
 
     try:
         resp = client.chat_postMessage(channel=ch, text=full_message, mrkdwn=True)
@@ -190,5 +253,5 @@ def slack_ask_human(
         return {"choice": 1, "option_text": options[0], "source": "timeout_default"}
 
     except Exception as exc:
-        logger.warning("slack_ask_human failed: %s", exc)
+        logger.warning("slack_ask_human failed: %s — defaulting to choice 1", exc)
         return {"choice": 1, "option_text": options[0], "source": "error_default"}

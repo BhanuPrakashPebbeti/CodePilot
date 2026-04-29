@@ -76,15 +76,16 @@ def check_syntax(path: str, tool_context: ToolContext) -> dict:
     """Check Python syntax for a file.
 
     Args:
-        path: File path to check.
+        path: File path to check (absolute or relative to project root).
 
     Returns:
         dict with ok and any syntax errors.
     """
-    from .exec import _resolve_cwd as _rc
-    p = _rc(path, tool_context)
+    from .fs import _resolve
+    p = _resolve(path, tool_context)
+    # Use list form to avoid shell injection on paths with spaces/special chars.
     r = subprocess.run(
-        f"python3 -m py_compile {str(p)}", shell=True,
+        ["python3", "-m", "py_compile", str(p)],
         capture_output=True, text=True, env=_clean_env(),
     )
     return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}

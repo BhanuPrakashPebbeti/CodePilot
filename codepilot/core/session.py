@@ -205,6 +205,29 @@ class SessionStore:
     def get_messages(self) -> list[dict]:
         return self._load_json(SESSION_MESSAGES_FILE, [])
 
+    def get_recent_history_display(self, max_messages: int = 10) -> list[dict]:
+        """Return the most recent messages formatted for terminal display.
+
+        Used by ``codepilot open`` to restore conversation context visibly.
+        Each returned dict has keys: role, content (truncated), timestamp.
+
+        Args:
+            max_messages: Maximum number of recent messages to return.
+
+        Returns:
+            List of dicts with role/content/timestamp, oldest first.
+        """
+        messages = self.get_messages()
+        recent = messages[-max_messages:] if len(messages) > max_messages else messages
+        return [
+            {
+                "role": m.get("role", "?"),
+                "content": m.get("content", "")[:500],
+                "timestamp": m.get("timestamp", "")[:19].replace("T", " "),
+            }
+            for m in recent
+        ]
+
     # ── Long-term structured memory ───────────────────────────────────────
 
     def add_episodic(self, event: str, resolution: str = "") -> None:

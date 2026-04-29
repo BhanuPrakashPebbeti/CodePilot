@@ -282,18 +282,51 @@ def create_command(
     _start_session(store, config_manager, debug)
 
 
+def _show_session_history(store: "SessionStore") -> None:
+    """Print recent conversation history to the terminal when resuming a session.
+
+    Shows the last 8 messages so the user has context before issuing the next
+    task. Truncated to 300 chars per message so the terminal doesn't flood.
+    """
+    from rich.panel import Panel
+    history = store.get_recent_history_display(max_messages=8)
+    if not history:
+        return
+
+    lines: list[str] = []
+    for msg in history:
+        role = msg["role"].upper()
+        ts = msg["timestamp"]
+        content = msg["content"].replace("\n", " ")
+        style = "cyan" if role == "USER" else "green"
+        lines.append(f"[{style}][{ts}] {role}:[/{style}] {content}")
+
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[dim]Recent history — {store.project_name}[/dim]",
+            border_style="dim",
+            padding=(0, 1),
+        )
+    )
+    console.print()
+
+
 @app.command("open")
 def open_command(
     project_name: str = typer.Argument(..., help="Name of the project session to resume"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode"),
+    history: bool = typer.Option(True, "--history/--no-history", help="Show recent conversation history on open"),
 ) -> None:
     """Resume an existing project session.
 
     Loads the project's memory, conversation history, and workspace path.
     Context from previous interactions is automatically injected into the LLM.
+    Recent conversation history is displayed on open so you have full context.
 
-    Example:
+    Examples:
         codepilot open kanban-board
+        codepilot open kanban-board --no-history   # skip history display
     """
     if debug:
         enable_debug_mode()
@@ -311,6 +344,11 @@ def open_command(
         raise typer.Exit(1)
 
     store.load_metadata()
+
+    # Restore conversation context visually so the user knows where they left off
+    if history:
+        _show_session_history(store)
+
     _start_session(store, config_manager, debug)
 
 

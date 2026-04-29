@@ -5,9 +5,10 @@ Key responsibilities
 - Configure ADK with persistent session storage (DatabaseSessionService)
 - Wire up the SQLite-backed memory service (SqliteMemoryService)
 - Apply ADK compatibility patches for non-Gemini providers
-- Stream pipeline events to the Rich terminal renderer
+- Stream pipeline events to the Rich terminal renderer with step timings
 - Inject previous-session memory context in interactive mode
 - Manage CodePilot session lifecycle (local tracking, error handling)
+- Emit per-step and end-of-pipeline profiling logs for observability
 
 Persistence model
 -----------------
@@ -23,6 +24,7 @@ import asyncio
 import json
 import logging as _logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -152,18 +154,18 @@ class CodePilotRunner:
             os.environ["GITHUB_TOKEN"] = self.github_token
             os.environ["GITHUB_PERSONAL_ACCESS_TOKEN"] = self.github_token
 
-        # Notion local tools read NOTION_TOKEN + NOTION_PARENT_PAGE_ID from env
+        # Notion and Slack local tools read credentials from env.
+        # Use direct assignment (not setdefault) so config always wins over
+        # stale or empty env vars from the parent shell.
         cfg = self.config_manager.config
         if cfg.notion.token:
-            os.environ.setdefault("NOTION_TOKEN", cfg.notion.token)
+            os.environ["NOTION_TOKEN"] = cfg.notion.token
         if cfg.notion.parent_page_id:
-            os.environ.setdefault("NOTION_PARENT_PAGE_ID", cfg.notion.parent_page_id)
-
-        # Slack local tools read SLACK_BOT_TOKEN + SLACK_CHANNEL from env
+            os.environ["NOTION_PARENT_PAGE_ID"] = cfg.notion.parent_page_id
         if cfg.slack.bot_token:
-            os.environ.setdefault("SLACK_BOT_TOKEN", cfg.slack.bot_token)
+            os.environ["SLACK_BOT_TOKEN"] = cfg.slack.bot_token
         if cfg.slack.channel:
-            os.environ.setdefault("SLACK_CHANNEL", cfg.slack.channel)
+            os.environ["SLACK_CHANNEL"] = cfg.slack.channel
 
         # Workspace is locked — set once, never overwritten
         os.environ["CODEPILOT_PROJECT_DIR"] = self.project_dir
@@ -223,6 +225,11 @@ class CodePilotRunner:
 
     async def _run_async(self, task: str, memory_context: str = "") -> None:
         self._cleanup_stale_plan_state()
+
+        # Reset profiling counters for this run
+        self._tool_call_count = 0
+        self._tool_call_times: list[float] = []
+        self._run_start = time.monotonic()
 
         root_agent = build_codepilot_agent(
             provider=self.provider,
@@ -297,7 +304,7 @@ class CodePilotRunner:
             while True:
                 try:
                     async for event in runner.run_async(
-                        user_id="user",
+                        user_id=_project_user_id,
                         session_id=session.id,
                         new_message=user_msg,
                     ):
@@ -357,6 +364,12 @@ class CodePilotRunner:
             raise
 
         finally:
+            elapsed = time.monotonic() - getattr(self, "_run_start", time.monotonic())
+            tool_calls = getattr(self, "_tool_call_count", 0)
+            logger.info(
+                "[Profiling] Pipeline finished in %.1fs — %d tool calls total",
+                elapsed, tool_calls,
+            )
             self.renderer.on_complete()
 
     # ── Event handler ─────────────────────────────────────────────────────
@@ -374,6 +387,14 @@ class CodePilotRunner:
                     args = dict(fc.args) if fc.args else {}
                 except (TypeError, ValueError):
                     args = {}
+                # Track tool call for profiling
+                self._tool_call_count = getattr(self, "_tool_call_count", 0) + 1
+                self._tool_call_times = getattr(self, "_tool_call_times", [])
+                self._tool_call_times.append(time.monotonic())
+                logger.debug(
+                    "[Profiling] Tool call #%d: %s",
+                    self._tool_call_count, fc.name,
+                )
                 self.renderer.on_tool_start(fc.name, args)
             if hasattr(part, "function_response") and part.function_response:
                 fr = part.function_response

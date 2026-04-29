@@ -7,15 +7,17 @@ Public API
 ----------
 guard_tool_loop               — safety guard against identical-call loops
 reset_tool_trackers           — reset per-agent counters (called on each iteration)
-increment_iteration           — increment LoopAgent iteration counter
+record_iteration_state        — fingerprint critical state for no-op detection
+increment_iteration           — increment LoopAgent iteration counter + profiling
+log_iteration_end             — log elapsed time for each completed iteration
 confirm_before_destructive_tool — human-in-the-loop confirmation (opt-in)
 compose_before_tool_callbacks — utility: chain multiple before_tool_callbacks
 """
 
 from typing import Callable, Optional
 
-from .guardrails import guard_tool_loop, reset_tool_trackers
-from .lifecycle import increment_iteration
+from .guardrails import guard_tool_loop, record_iteration_state, reset_tool_trackers
+from .lifecycle import increment_iteration, log_iteration_end
 from .human_in_loop import confirm_before_destructive_tool
 
 
@@ -47,7 +49,9 @@ def compose_before_tool_callbacks(*fns: Callable) -> Callable:
 __all__ = [
     "guard_tool_loop",
     "reset_tool_trackers",
+    "record_iteration_state",
     "increment_iteration",
+    "log_iteration_end",
     "confirm_before_destructive_tool",
     "compose_before_tool_callbacks",
 ]

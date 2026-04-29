@@ -52,6 +52,8 @@ from .callbacks import (
     confirm_before_destructive_tool,
     guard_tool_loop,
     increment_iteration,
+    log_iteration_end,
+    record_iteration_state,
 )
 from .mcp_config import (
     get_finalizer_mcp_tools,
@@ -279,12 +281,18 @@ def build_codepilot_agent(
         output_key="debug_output",
     )
 
+    def _after_loop_iteration(callback_context) -> None:
+        """Record state fingerprint for no-op detection + log elapsed time."""
+        record_iteration_state(dict(callback_context.state))
+        log_iteration_end(callback_context)
+
     # ── Development loop ──────────────────────────────────────────────────
     dev_loop = LoopAgent(
         name="DevelopmentLoop",
         sub_agents=[developer, runtime, test_agent, debug],
         max_iterations=max_iterations,
         before_agent_callback=increment_iteration,
+        after_agent_callback=_after_loop_iteration,
     )
 
     # ── 3. Finalizer ──────────────────────────────────────────────────────

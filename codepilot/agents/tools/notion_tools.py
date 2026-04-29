@@ -12,17 +12,25 @@ Schema: page-hierarchy (not databases) for broad compatibility.
         ├── 📋 Tasks  (status updates appended inline)
         └── 📜 Execution Log  (timestamped events appended inline)
 
+Each write is verified by inspecting the API response. On failure the call
+retries once before returning an error (avoids silent data loss).
+
 Requires: notion-client>=2.0.0  (pip install notion-client)
 Env vars: NOTION_TOKEN, NOTION_PARENT_PAGE_ID
 """
 
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from ...utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Retry: one automatic retry on any Notion API failure.
+_MAX_RETRIES = 1
+_RETRY_DELAY = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +94,30 @@ def _skipped(reason: str = "Notion not configured") -> dict:
     return {"ok": True, "skipped": True, "reason": reason, "project_id": ""}
 
 
+def _append_with_retry(client, block_id: str, children: list) -> dict:
+    """Append blocks to a Notion page with one retry on failure.
+
+    Returns the raw API response on success, or raises the last exception.
+    """
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            resp = client.blocks.children.append(block_id=block_id, children=children)
+            # Verify the write landed: response must contain results
+            if not resp or not resp.get("results"):
+                raise ValueError("Notion append returned empty results — write may have failed")
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _MAX_RETRIES:
+                logger.warning(
+                    "Notion append failed (attempt %d/%d): %s — retrying in %.0fs",
+                    attempt + 1, _MAX_RETRIES + 1, exc, _RETRY_DELAY,
+                )
+                time.sleep(_RETRY_DELAY)
+    raise last_exc  # type: ignore[misc]
+
+
 # ---------------------------------------------------------------------------
 # Public tools
 # ---------------------------------------------------------------------------
@@ -118,42 +150,52 @@ def notion_create_project(
 
     parent_id = os.environ.get("NOTION_PARENT_PAGE_ID", "")
     if not parent_id:
-        return {
-            "ok": False,
-            "error": (
-                "NOTION_PARENT_PAGE_ID env var not set. "
-                "Set it to the Notion page ID you want projects nested under."
-            ),
-        }
-
-    try:
-        page = client.pages.create(
-            parent={"type": "page_id", "page_id": parent_id},
-            properties={
-                "title": {
-                    "title": [{"type": "text", "text": {"content": f"🚀 {project_name}"}}]
-                }
-            },
-            children=[
-                _para(f"📁 Workspace: {workspace_path}"),
-                _para(f"📅 Started: {_now()}"),
-                _para("📊 Status: 🔄 ACTIVE"),
-                _para(f"📝 Goal: {summary}" if summary else "📝 Goal: (see user request)"),
-                _divider(),
-                _h3("📋 Tasks"),
-                _para("Tasks will appear below as the plan is created."),
-                _divider(),
-                _h3("📜 Execution Log"),
-                _para("Execution events will be logged below."),
-            ],
+        logger.warning(
+            "NOTION_PARENT_PAGE_ID is not set — Notion project tracking skipped. "
+            "Run: codepilot config init → Update Notion token and paste your parent page ID."
         )
-        page_id = page["id"]
-        url = page.get("url", "")
-        logger.info("Notion project page created: %s → %s", project_name, page_id)
-        return {"ok": True, "project_id": page_id, "url": url}
-    except Exception as exc:
-        logger.warning("notion_create_project failed: %s", exc)
-        return {"ok": False, "error": str(exc), "project_id": ""}
+        return _skipped("NOTION_PARENT_PAGE_ID not configured")
+
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            page = client.pages.create(
+                parent={"type": "page_id", "page_id": parent_id},
+                properties={
+                    "title": {
+                        "title": [{"type": "text", "text": {"content": f"🚀 {project_name}"}}]
+                    }
+                },
+                children=[
+                    _para(f"📁 Workspace: {workspace_path}"),
+                    _para(f"📅 Started: {_now()}"),
+                    _para("📊 Status: 🔄 ACTIVE"),
+                    _para(f"📝 Goal: {summary}" if summary else "📝 Goal: (see user request)"),
+                    _divider(),
+                    _h3("📋 Tasks"),
+                    _para("Tasks will appear below as the plan is created."),
+                    _divider(),
+                    _h3("📜 Execution Log"),
+                    _para("Execution events will be logged below."),
+                ],
+            )
+            page_id = page.get("id", "")
+            url = page.get("url", "")
+            if not page_id:
+                raise ValueError("Notion page creation returned no page ID")
+            logger.info("Notion project page created: %s → %s", project_name, page_id)
+            return {"ok": True, "project_id": page_id, "url": url}
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _MAX_RETRIES:
+                logger.warning(
+                    "notion_create_project failed (attempt %d/%d): %s — retrying",
+                    attempt + 1, _MAX_RETRIES + 1, exc,
+                )
+                time.sleep(_RETRY_DELAY)
+
+    logger.error("notion_create_project failed after %d attempts: %s", _MAX_RETRIES + 1, last_exc)
+    return {"ok": False, "error": str(last_exc), "project_id": ""}
 
 
 def notion_update_project_status(
@@ -185,13 +227,10 @@ def notion_update_project_status(
         text += f"\n{summary[:500]}"
 
     try:
-        client.blocks.children.append(
-            block_id=project_id,
-            children=[_divider(), _para(text)],
-        )
+        _append_with_retry(client, project_id, [_divider(), _para(text)])
         return {"ok": True}
     except Exception as exc:
-        logger.warning("notion_update_project_status failed: %s", exc)
+        logger.error("notion_update_project_status failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -227,13 +266,10 @@ def notion_add_task(
         f"   Agent: {assigned_agent} | Priority: {priority} | Status: TODO"
     )
     try:
-        client.blocks.children.append(
-            block_id=project_id,
-            children=[_para(text)],
-        )
+        _append_with_retry(client, project_id, [_para(text)])
         return {"ok": True}
     except Exception as exc:
-        logger.warning("notion_add_task failed: %s", exc)
+        logger.error("notion_add_task failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -268,13 +304,10 @@ def notion_update_task_status(
         text += f"\n{logs[:600]}"
 
     try:
-        client.blocks.children.append(
-            block_id=project_id,
-            children=[_para(text)],
-        )
+        _append_with_retry(client, project_id, [_para(text)])
         return {"ok": True}
     except Exception as exc:
-        logger.warning("notion_update_task_status failed: %s", exc)
+        logger.error("notion_update_task_status failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -305,11 +338,8 @@ def notion_log_execution(
     text = f"[{_now()}] {_icon(event_type)} [{event_type.upper()}] {details[:1200]}"
 
     try:
-        client.blocks.children.append(
-            block_id=project_id,
-            children=[_para(text)],
-        )
+        _append_with_retry(client, project_id, [_para(text)])
         return {"ok": True}
     except Exception as exc:
-        logger.warning("notion_log_execution failed: %s", exc)
+        logger.error("notion_log_execution failed: %s", exc)
         return {"ok": False, "error": str(exc)}
