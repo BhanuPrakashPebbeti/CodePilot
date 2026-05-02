@@ -14,6 +14,7 @@ observable. Set CODEPILOT_BROWSER_HEADLESS=true to override.
 
 import os
 import shutil
+from pathlib import Path
 from typing import Optional
 
 from google.adk.tools.mcp_tool import McpToolset
@@ -25,15 +26,29 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 _TIMEOUT = 300.0
+_NPX_PATH: Optional[str] = shutil.which("npx")  # cached at import time
 
 
 def _npx_available() -> bool:
-    return shutil.which("npx") is not None
+    return _NPX_PATH is not None
 
 
 def _headless() -> bool:
     """Return True only when explicitly opted into headless mode."""
     return os.environ.get("CODEPILOT_BROWSER_HEADLESS", "").lower() in ("1", "true", "yes")
+
+
+def _screenshots_dir() -> str:
+    """Return the absolute path for Playwright screenshot output.
+
+    Defaults to <project_dir>/tests/screenshots so all artifacts are saved
+    inside the project workspace, not in the Playwright working directory.
+    Reads CODEPILOT_PROJECT_DIR which is set by the runner before agents run.
+    """
+    project_dir = os.environ.get("CODEPILOT_PROJECT_DIR", ".")
+    path = Path(project_dir) / "tests" / "screenshots"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -45,22 +60,26 @@ def get_playwright_toolset() -> Optional[McpToolset]:
 
     Runs in headed (visible) mode by default so testers can observe browser
     actions in real time. Override with CODEPILOT_BROWSER_HEADLESS=true.
+
+    Screenshots are saved to <project_dir>/tests/screenshots/ so all artifacts
+    stay inside the project workspace (not scattered in the npx working dir).
     """
     if not _npx_available():
         logger.info("npx not found — Playwright MCP skipped")
         return None
 
-    args = ["-y", "@playwright/mcp@latest"]
+    output_dir = _screenshots_dir()
+    args = ["-y", "@playwright/mcp@latest", "--output-dir", output_dir]
     if _headless():
         args.append("--headless")
-        logger.info("Playwright MCP starting in headless mode (CODEPILOT_BROWSER_HEADLESS=true)")
+        logger.info("Playwright MCP: headless mode, output=%s", output_dir)
     else:
-        logger.info("Playwright MCP starting in headed mode — browser window will be visible")
+        logger.info("Playwright MCP: headed mode, output=%s", output_dir)
 
     return McpToolset(
         connection_params=StdioConnectionParams(
             server_params=StdioServerParameters(
-                command="npx",
+                command=_NPX_PATH,
                 args=args,
             ),
             timeout=_TIMEOUT,

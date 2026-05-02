@@ -311,9 +311,12 @@ class ConfigManager:
     ) -> None:
         """Update Notion integration config.
 
+        Databases are created per-project by notion_setup_project() at runtime.
+        Only the token and parent page ID are stored in config.
+
         Args:
             token: Notion integration token (secret_xxx).
-            parent_page_id: ID of the Notion page to nest project pages under.
+            parent_page_id: Page to create project root pages under.
         """
         if not self._config:
             raise ConfigurationError("No configuration exists")

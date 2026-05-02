@@ -30,13 +30,15 @@ from ...utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+_slack_client_cache: dict = {}
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 def _client():
-    """Return a slack_sdk.WebClient or None if not configured."""
+    """Return a cached slack_sdk.WebClient or None if not configured."""
     try:
         from slack_sdk import WebClient
     except ImportError:
@@ -45,7 +47,9 @@ def _client():
     token = os.environ.get("SLACK_BOT_TOKEN")
     if not token:
         return None
-    return WebClient(token=token)
+    if token not in _slack_client_cache:
+        _slack_client_cache[token] = WebClient(token=token)
+    return _slack_client_cache[token]
 
 
 def _channel() -> str:
@@ -74,31 +78,51 @@ def _resolve_channel_id(client, channel_name: str) -> Optional[str]:
 
 
 def _ensure_bot_in_channel(client, channel: str) -> bool:
-    """Return True if the bot is a member of *channel* (name or ID).
+    """Check if the bot is in *channel*. Logs a clear invite instruction if not.
 
-    Attempts to join public channels automatically. For private channels the
-    bot must be manually invited. Returns False and logs clearly on failure.
+    Returns True if the bot is a member or if the check is inconclusive (so
+    the send attempt can still be made). Returns False only when we are
+    certain the bot cannot post (private channel, not a member).
     """
     try:
-        # Try to get channel info — works if bot is already a member
         resp = client.conversations_info(channel=channel)
         ch = resp.get("channel", {})
+        ch_name = ch.get("name", channel)
+
         if ch.get("is_member"):
             return True
-        # Not a member — try to join (only works for public channels)
+
+        # Not a member — try joining (requires channels:join scope)
         if not ch.get("is_private", True):
-            client.conversations_join(channel=channel)
-            logger.info("Bot joined public channel '%s'", channel)
-            return True
-        logger.warning(
-            "Bot is NOT in private channel '%s'. "
-            "Please invite the bot manually: /invite @<bot-name>",
-            channel,
-        )
-        return False
+            try:
+                client.conversations_join(channel=channel)
+                logger.info("Bot auto-joined public channel #%s", ch_name)
+                return True
+            except Exception as join_exc:
+                err = str(join_exc)
+                if "missing_scope" in err:
+                    logger.warning(
+                        "Bot is not in #%s and lacks 'channels:join' scope to auto-join.\n"
+                        "  ▶ Fix (choose one):\n"
+                        "    1. In Slack: go to #%s → type /invite @%s\n"
+                        "    2. Or add 'channels:join' scope to your Slack app at "
+                        "api.slack.com/apps → OAuth & Permissions → Bot Token Scopes",
+                        ch_name, ch_name, ch_name,
+                    )
+                else:
+                    logger.warning("Could not join #%s: %s", ch_name, join_exc)
+                # Proceed anyway — send will fail with a clear error
+                return True
+        else:
+            logger.warning(
+                "Bot is not in private channel #%s. "
+                "Invite it in Slack: /invite @<bot-name> in that channel.",
+                ch_name,
+            )
+            return False
+
     except Exception as exc:
-        logger.warning("Channel membership check failed for '%s': %s", channel, exc)
-        # Proceed optimistically — the send will fail with a clearer error if blocked.
+        logger.debug("Channel membership check failed for '%s': %s — proceeding optimistically", channel, exc)
         return True
 
 
@@ -145,10 +169,80 @@ def slack_notify(
         logger.info("Slack notification sent to %s", ch)
         return {"ok": True, "ts": resp.get("ts", ""), "channel": ch}
     except Exception as exc:
-        logger.warning(
-            "slack_notify failed for channel '%s': %s — pipeline continues without Slack", ch, exc
-        )
-        return {"ok": False, "error": str(exc)}
+        err_str = str(exc)
+        if "not_in_channel" in err_str:
+            ch_name = ch.lstrip("#")
+            logger.warning(
+                "Slack: bot is not in channel %s — message not delivered.\n"
+                "  ▶ Fix: In Slack, open #%s and run: /invite @<your-bot-name>",
+                ch, ch_name,
+            )
+        else:
+            logger.warning("slack_notify failed for %s: %s — pipeline continues", ch, exc)
+        # Always return ok=True so the pipeline is not blocked by Slack failures
+        return {"ok": True, "skipped": True, "reason": str(exc)}
+
+
+def slack_structured_notify(
+    update_type: str,
+    project_name: str,
+    task_name: str = "",
+    status: str = "",
+    details: str = "",
+    repo_url: str = "",
+    pr_url: str = "",
+    notion_url: str = "",
+    channel: str = "",
+) -> dict:
+    """Send a structured, high-value event notification to Slack.
+
+    Use this instead of slack_notify for pipeline events. Only call at key
+    transitions — not for every minor action.
+
+    Args:
+        update_type: One of TASK_UPDATE | ERROR | HUMAN_INPUT | FINAL_SUCCESS
+        project_name: Display name of the project.
+        task_name: Task being worked on (omit for project-level events).
+        status: Short status string (e.g. "DONE", "FAILED", "3/4 tasks complete").
+        details: One-line description of what happened or what went wrong.
+        repo_url: GitHub repository URL (included in Links line if provided).
+        pr_url: GitHub pull request URL (included in Links line if provided).
+        notion_url: Notion project page URL (included in Links line if provided).
+        channel: Override channel (uses SLACK_CHANNEL env var if empty).
+
+    Returns:
+        {"ok": True, "ts": str, "channel": str}
+        or {"ok": True, "skipped": True} if Slack is not configured.
+    """
+    _ICONS = {
+        "TASK_UPDATE":   "⚙️",
+        "ERROR":         "🚨",
+        "HUMAN_INPUT":   "🤔",
+        "FINAL_SUCCESS": "✅",
+        "FINAL_FAILURE": "❌",
+    }
+    utype = update_type.upper()
+    icon = _ICONS.get(utype, "📋")
+
+    lines: list[str] = [f"{icon} *[{utype}] {project_name}*"]
+    if task_name:
+        lines.append(f"Task: _{task_name}_")
+    if status:
+        lines.append(f"Status: *{status}*")
+    if details:
+        lines.append(details)
+
+    link_parts: list[str] = []
+    if repo_url:
+        link_parts.append(f"<{repo_url}|Repo>")
+    if pr_url:
+        link_parts.append(f"<{pr_url}|PR>")
+    if notion_url:
+        link_parts.append(f"<{notion_url}|Notion>")
+    if link_parts:
+        lines.append("Links: " + "  ·  ".join(link_parts))
+
+    return slack_notify(message="\n".join(lines), channel=channel)
 
 
 def slack_ask_human(
@@ -253,5 +347,14 @@ def slack_ask_human(
         return {"choice": 1, "option_text": options[0], "source": "timeout_default"}
 
     except Exception as exc:
-        logger.warning("slack_ask_human failed: %s — defaulting to choice 1", exc)
+        err_str = str(exc)
+        if "not_in_channel" in err_str:
+            ch_name = ch.lstrip("#")
+            logger.warning(
+                "Slack HITL: bot not in channel %s — defaulting to choice 1.\n"
+                "  ▶ Fix: In Slack, open #%s and run: /invite @<your-bot-name>",
+                ch, ch_name,
+            )
+        else:
+            logger.warning("slack_ask_human failed: %s — defaulting to choice 1", exc)
         return {"choice": 1, "option_text": options[0], "source": "error_default"}

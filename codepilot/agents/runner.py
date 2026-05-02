@@ -84,7 +84,12 @@ _TRANSIENT_TYPES = frozenset({
     "InternalServerError", "BadGatewayError", "Timeout", "RateLimitError",
     "McpError", "ClosedResourceError",
 })
-_MAX_RETRIES = 3
+# Only 1 full-pipeline retry — retrying more re-runs the PlannerAgent,
+# which creates duplicate Notion projects and duplicates work already done.
+# Transient errors mid-pipeline are better handled by making agents idempotent
+# (PlannerAgent checks for existing plan, DeveloperAgent checks existing files)
+# rather than re-running the whole pipeline multiple times.
+_MAX_RETRIES = 1
 _RETRY_DELAY = 5.0
 
 
@@ -162,6 +167,8 @@ class CodePilotRunner:
             os.environ["NOTION_TOKEN"] = cfg.notion.token
         if cfg.notion.parent_page_id:
             os.environ["NOTION_PARENT_PAGE_ID"] = cfg.notion.parent_page_id
+        # Per-project Notion DB IDs are created fresh each session by notion_setup_project()
+        # and stored in ADK session state — not in env vars or global config.
         if cfg.slack.bot_token:
             os.environ["SLACK_BOT_TOKEN"] = cfg.slack.bot_token
         if cfg.slack.channel:
@@ -248,21 +255,25 @@ class CodePilotRunner:
             memory_service=self._memory_service,
         )
 
-        # Clean per-run ADK state — scoped to this project via user_id.
-        # review_output removed (ReviewAgent was removed from pipeline).
         _initial_state = {
-            "project_dir":     self.project_dir,
-            "plan_summary":    "",
-            "iteration_count": "0",
-            "app_type":        "",
-            "app_url":         "",
-            "app_ready":       "false",
-            "runtime_error":   "",
-            "test_result":     "",
-            "test_errors":     "",
-            "debug_log":       "",
-            "final_status":    "",
-            "notion_project_id": "",
+            "project_dir":       self.project_dir,
+            "plan_summary":      "",
+            "iteration_count":   "0",
+            "app_type":          "",
+            "app_url":           "",
+            "app_ready":         "false",
+            "runtime_error":     "",
+            "test_result":       "",
+            "test_errors":       "",
+            "debug_log":         "",
+            "final_status":      "",
+            # Notion per-project IDs (populated by PlannerAgent via notion_setup_project)
+            "notion_project_id":      "",
+            "notion_tasks_db_id":     "",
+            "notion_logs_db_id":      "",
+            "notion_artifacts_db_id": "",
+            "notion_qa_page_id":      "",
+            # Other integrations
             "github_repo_url":   "",
             "hitl_decision":     "",
             "screenshot_paths":  "",
@@ -335,10 +346,38 @@ class CodePilotRunner:
 
                     # DatabaseSessionService cannot resume a broken invocation
                     # with new_message=None — it requires a fresh session.
+                    # Carry forward any meaningful state already written (plan,
+                    # Notion project ID, app state) so the PlannerAgent idempotency
+                    # check and DeveloperAgent don't restart from scratch.
+                    try:
+                        _prev = await self._session_service.get_session(
+                            app_name="codepilot",
+                            user_id=_project_user_id,
+                            session_id=session.id,
+                        )
+                        _carry_keys = {
+                            "project_dir", "plan_summary",
+                            "notion_project_id", "notion_tasks_db_id",
+                            "notion_logs_db_id", "notion_artifacts_db_id",
+                            "notion_qa_page_id",
+                            "app_type", "app_url", "app_ready",
+                            "runtime_error", "test_result", "test_errors",
+                            "debug_log", "final_status", "github_repo_url",
+                            "screenshot_paths", "iteration_count",
+                        }
+                        _retry_state = dict(_initial_state)
+                        if _prev and _prev.state:
+                            for _k in _carry_keys:
+                                _v = _prev.state.get(_k, "")
+                                if _v:
+                                    _retry_state[_k] = _v
+                    except Exception:
+                        _retry_state = _initial_state
+
                     session = await self._session_service.create_session(
                         app_name="codepilot",
                         user_id=_project_user_id,
-                        state=_initial_state,
+                        state=_retry_state,
                     )
 
             # Persist ADK session events to project-scoped long-term memory

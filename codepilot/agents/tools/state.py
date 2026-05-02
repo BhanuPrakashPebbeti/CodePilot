@@ -14,19 +14,24 @@ logger = get_logger(__name__)
 
 ALLOWED_STATE_KEYS = frozenset({
     # Core pipeline state
-    "app_type",           # "web" | "api" | "fullstack" | "cli" | "library" | "script"
-    "app_url",            # primary URL for web/API testing
-    "app_ready",          # "true" when app is built and responding
-    "runtime_error",      # error details from Runtime Agent (empty = no error)
-    "test_result",        # "PASS" | "FAIL: ..." | "SKIP: ..."
-    "test_errors",        # verbose error output from the Test Agent
-    "debug_log",          # summary of what the Debug Agent fixed
-    "final_status",       # "SUCCESS" | "PARTIAL: ..." | "FAILED: ..."
-    # Traceability & external integrations
-    "notion_project_id",  # Notion page ID for this project (set by PlannerAgent)
-    "github_repo_url",    # GitHub repo URL after creation (set by FinalizerAgent)
-    "hitl_decision",      # Last human-in-the-loop decision, e.g. "1: Retry fixing"
-    "screenshot_paths",   # Comma-separated list of captured screenshot file paths
+    "app_type",              # "web" | "api" | "fullstack" | "cli" | "library" | "script"
+    "app_url",               # primary URL for web/API testing
+    "app_ready",             # "true" when app is built and responding
+    "runtime_error",         # error details from Runtime Agent (empty = no error)
+    "test_result",           # "PASS" | "FAIL: ..." | "SKIP: ..."
+    "test_errors",           # verbose error output from the Test Agent
+    "debug_log",             # summary of what the Debug Agent fixed
+    "final_status",          # "SUCCESS" | "PARTIAL: ..." | "FAILED: ..."
+    # Notion per-project IDs (all set by PlannerAgent via notion_setup_project)
+    "notion_project_id",     # root project page ID
+    "notion_tasks_db_id",    # Tasks database ID (child of project page)
+    "notion_logs_db_id",     # Activity Log database ID (child of project page)
+    "notion_artifacts_db_id",# Test Artifacts database ID (child of project page)
+    "notion_qa_page_id",     # QA sub-page ID (set by TestAgent)
+    # External integration references
+    "github_repo_url",       # GitHub repo/PR URL (set by FinalizerAgent)
+    "hitl_decision",         # Last human-in-the-loop decision
+    "screenshot_paths",      # Comma-separated screenshot file paths
 })
 
 
@@ -34,7 +39,9 @@ def set_state(key: str, value: str, tool_context: ToolContext) -> dict:
     """Set a shared state variable for inter-agent communication.
 
     Allowed keys: app_type, app_url, app_ready, runtime_error,
-    test_result, test_errors, debug_log, final_status.
+    test_result, test_errors, debug_log, final_status,
+    notion_project_id, notion_qa_page_id, github_repo_url,
+    hitl_decision, screenshot_paths.
 
     Args:
         key:   State variable name (must be in the allowed set).

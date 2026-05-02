@@ -7,7 +7,7 @@ within a session without temp files or subprocesses.
 
 import json
 import time
-import uuid
+from collections import Counter
 from typing import Optional
 
 from google.adk.tools.tool_context import ToolContext
@@ -185,7 +185,8 @@ def get_plan_status(tool_context: ToolContext) -> dict:
     """
     plan = _get_plan(tool_context)
     tasks = plan.get("tasks", [])
-    counts = {"pending": 0, "in_progress": 0, "done": 0, "failed": 0, "skipped": 0}
-    for t in tasks:
-        counts[t.get("status", "pending")] = counts.get(t.get("status", "pending"), 0) + 1
+    counts = dict(Counter(t.get("status", "pending") for t in tasks))
+    # Ensure all expected keys are present even if count is zero
+    for k in ("pending", "in_progress", "done", "failed", "skipped"):
+        counts.setdefault(k, 0)
     return {"ok": True, "goal": plan.get("goal", ""), "tasks": tasks, "counts": counts}

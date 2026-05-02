@@ -87,14 +87,17 @@ class GitHubConfig(BaseModel):
 
 
 class NotionConfig(BaseModel):
-    """Notion integration — multi-project lifecycle tracking.
+    """Notion integration — per-project Jira-like databases.
+
+    Databases are created fresh per project by notion_setup_project() at the
+    start of each session. No global databases are needed in config.
 
     Required env vars (read directly by notion_tools.py):
-      NOTION_TOKEN            — integration token from notion.so/profile/integrations
-      NOTION_PARENT_PAGE_ID   — Notion page ID to nest project pages under
+      NOTION_TOKEN          — integration token from notion.so/profile/integrations
+      NOTION_PARENT_PAGE_ID — page to create project root pages under
     """
-    token: Optional[str] = None            # Integration token (also set as NOTION_TOKEN env var)
-    parent_page_id: Optional[str] = None   # Page ID to create project pages under
+    token: Optional[str] = None            # Integration token
+    parent_page_id: Optional[str] = None   # Page to create project pages under
 
 
 class SlackConfig(BaseModel):

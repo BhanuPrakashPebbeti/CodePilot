@@ -1,22 +1,15 @@
 """Local ADK FunctionTools for CodePilot agents.
 
-These replace all internal MCP servers (filesystem, bash, git, workspace,
-testing, debug, environment, planning, memory) with direct Python calls.
-No subprocess spawn overhead — tools run in the same agent process.
+All internal capabilities run as direct Python calls (no MCP subprocess overhead).
+Only Playwright and GitHub remain as external MCP servers.
 
-Only external integrations (Playwright, GitHub) remain as MCP.
-Notion and Slack now use local Python tools (notion_tools, slack_hitl)
-for fine-grained schema control and HITL support.
-
-Tool sets per agent
--------------------
-Planner    → workspace + environment + planning + memory + notion (create project/tasks/log)
-Developer  → fs + exec + git + workspace + environment + planning + notion (update task status)
-Runtime    → exec + testing + state + notion (log execution) + slack (notify on failure)
-TestAgent  → testing + state + notion (log test result)
-DebugAgent → debug_tools + fs + exec + memory + validation + state + notion + slack (HITL)
-Finalizer  → fs + git + exec + memory + state + notion (project status) + slack (notify)
-             (+ GitHub MCP externally for PR creation)
+Notion tools use local notion_client for structured databases:
+  Planner     → notion_setup_project (creates page + 3 child DBs) + notion_create_task
+  Developer   → notion_update_task + notion_add_comment + notion_log_event + notion_query_tasks
+  Runtime     → notion_log_event
+  TestAgent   → notion_create_qa_page + notion_log_qa_step + notion_finalize_qa + notion_add_artifact
+  DebugAgent  → notion_query_tasks + notion_update_task + notion_add_comment + notion_log_event
+  Finalizer   → notion_finalize_project + notion_log_event
 """
 
 from .debug_tools import find_errors_in_output, parse_error, read_log_tail
@@ -65,11 +58,24 @@ from .memory_tools import (
     store_memory,
 )
 from .notion_tools import (
-    notion_add_task,
-    notion_create_project,
-    notion_log_execution,
-    notion_update_project_status,
-    notion_update_task_status,
+    # Setup (PlannerAgent)
+    notion_setup_project,
+    # Task management
+    notion_create_task,
+    notion_update_task,
+    notion_query_tasks,
+    notion_add_comment,
+    # Activity logging
+    notion_log_event,
+    # Test artifacts
+    notion_add_artifact,
+    # QA sub-page workflow (TestAgent)
+    notion_create_qa_page,
+    notion_log_qa_step,
+    notion_add_screenshot,
+    notion_finalize_qa,
+    # Finalization (FinalizerAgent)
+    notion_finalize_project,
 )
 from .planning import (
     complete_task,
@@ -80,7 +86,7 @@ from .planning import (
     skip_task,
     start_task,
 )
-from .slack_hitl import slack_ask_human, slack_notify
+from .slack_hitl import slack_ask_human, slack_notify, slack_structured_notify
 from .testing import check_syntax, http_request, run_tests
 from .state import exit_loop, set_state, ALLOWED_STATE_KEYS
 from .validation import check_exit_conditions, force_exit_conditions
@@ -101,13 +107,15 @@ PLANNER_TOOLS = [
     detect_project, get_project_tree, find_files, read_dependencies,
     # Environment
     detect_runtimes, check_runtime,
-    # Planning (writes to ADK state)
+    # Planning
     create_plan, get_plan_status,
-    # Memory (check prior work before planning)
+    # Memory (check prior work)
     get_recent_conversations, search_memories,
-    # Notion: create project page + add tasks + log plan event
-    notion_create_project, notion_add_task, notion_log_execution,
-    # State: store notion_project_id after creating project
+    # Notion: setup full project structure + create tasks + log plan
+    notion_setup_project, notion_create_task, notion_log_event,
+    # Slack: structured plan-ready notification only
+    slack_structured_notify,
+    # State: store all notion IDs + project state
     set_state,
 ]
 
@@ -121,12 +129,14 @@ DEVELOPER_TOOLS = [
     detect_project, get_project_tree, find_files, search_codebase, read_dependencies,
     # Environment
     detect_runtimes, check_runtime, create_venv, check_venv,
-    # Git (conventional commits: "feat: ...", "fix: ...", "chore: ...")
+    # Git (conventional commits)
     git_init, git_status, git_add, git_commit, git_commit_all, git_info,
     # Task management
     get_current_task, start_task, complete_task, fail_task, skip_task, get_plan_status,
-    # Notion: update task status as work progresses
-    notion_update_task_status, notion_log_execution,
+    # Notion: query tasks + update status + comment + log events
+    notion_query_tasks, notion_update_task, notion_add_comment, notion_log_event,
+    # Slack: one structured message when all tasks done
+    slack_structured_notify,
 ]
 
 RUNTIME_TOOLS = [
@@ -135,17 +145,26 @@ RUNTIME_TOOLS = [
     wait_for_port, get_background_output,
     # Verification
     http_request, run_tests,
-    # Notion: log run/error events
-    notion_log_execution,
-    # Slack: notify on failure so humans are aware
-    slack_notify,
+    # Notion: log run/error events to Activity Log DB
+    notion_log_event,
+    # State
+    set_state,
+    # Slack: structured error notification only (silent on success)
+    slack_structured_notify,
 ]
 
 TEST_TOOLS = [
-    # HTTP testing (Playwright MCP handles browser UI)
+    # HTTP + unit testing
     http_request, run_tests, check_syntax,
-    # Notion: log test results, mark task BLOCKED on failure
-    notion_update_task_status, notion_log_execution,
+    # File system: create screenshots dir
+    create_directory, run_command,
+    # State (test_result, screenshot_paths, notion_qa_page_id)
+    set_state,
+    # Notion: QA sub-page + step logs + screenshot recording + artifacts
+    notion_create_qa_page, notion_log_qa_step, notion_add_screenshot,
+    notion_finalize_qa, notion_add_artifact, notion_log_event,
+    # Slack: one structured test-result notification
+    slack_structured_notify,
 ]
 
 DEBUG_TOOLS = [
@@ -153,35 +172,37 @@ DEBUG_TOOLS = [
     parse_error, find_errors_in_output, read_log_tail,
     # File fixing
     read_file, replace_in_file, write_file,
-    # Execution (run diagnostics)
+    # Execution
     run_command,
-    # Memory (search known fixes, save new ones)
+    # Memory: search known fixes, store new ones
     search_memories, store_memory,
-    # Task management (mark task failed when fix is exhausted)
+    # Task management
     fail_task,
-    # Exit-condition gate (MUST check before exit_loop)
+    # Exit-condition gate
     check_exit_conditions, force_exit_conditions,
-    # Notion: log fixes + mark tasks BLOCKED/DONE/FAILED
-    notion_update_task_status, notion_log_execution,
-    # Slack: notify on persistent failures + HITL decisions
-    slack_notify, slack_ask_human,
+    # Notion: query blocked tasks + update + comment + log fixes
+    notion_query_tasks, notion_update_task, notion_add_comment, notion_log_event,
+    # Slack: HITL only (no regular notifications)
+    slack_ask_human,
+    # State
+    set_state,
 ]
 
 FINALIZER_TOOLS = [
     # File writing (README)
     read_file, write_file,
-    # Process management (stop servers)
+    # Process management
     stop_background_process,
     # Git (final commit + push)
     git_status, git_add, git_commit_all, git_info, git_push,
-    # Execution (cleanup commands)
+    # Execution
     run_command,
-    # Memory (save session summary)
+    # Memory
     store_memory, get_project_context,
-    # Notion: mark project COMPLETED/FAILED with summary
-    notion_update_project_status, notion_log_execution,
-    # Slack: post completion/failure notification
-    slack_notify,
+    # Notion: finalize project + log deploy event
+    notion_finalize_project, notion_log_event,
+    # Slack: final notification with ALL links (repo, PR, Notion)
+    slack_structured_notify,
 ]
 
 __all__ = [
@@ -209,11 +230,15 @@ __all__ = [
     # memory
     "store_memory", "search_memories", "get_recent_conversations",
     "get_project_context", "delete_memory",
-    # notion
-    "notion_create_project", "notion_add_task", "notion_update_task_status",
-    "notion_update_project_status", "notion_log_execution",
+    # notion — structured project management
+    "notion_setup_project",
+    "notion_create_task", "notion_update_task", "notion_query_tasks", "notion_add_comment",
+    "notion_log_event",
+    "notion_add_artifact",
+    "notion_create_qa_page", "notion_log_qa_step", "notion_add_screenshot", "notion_finalize_qa",
+    "notion_finalize_project",
     # slack
-    "slack_notify", "slack_ask_human",
+    "slack_notify", "slack_ask_human", "slack_structured_notify",
     # validation
     "check_exit_conditions", "force_exit_conditions",
     # bundles

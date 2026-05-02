@@ -14,6 +14,7 @@ from .core.exceptions import CodePilotError, ConfigurationError
 from .core.global_memory import GlobalMemory
 from .core.session import SessionStore
 from .core.workspace import select_workspace
+from .onboarding import onboard_github, onboard_notion, onboard_slack
 from .utils import console, enable_debug_mode, get_logger
 from .utils.constants import (
     APP_NAME,
@@ -145,32 +146,20 @@ def interactive_config_setup() -> bool:
     
     # Optional integrations
     console.print("\n[cyan]Optional Integrations:[/cyan]")
-    console.print("[dim]These enable GitHub push, Notion planning, and Slack notifications.[/dim]")
+    console.print("[dim]These enable GitHub push, Notion project tracking, and Slack notifications.[/dim]")
     console.print("[dim]All are optional — CodePilot works fully without them.[/dim]\n")
 
-    if Confirm.ask("Configure GitHub token?", default=False):
-        console.print("[dim]Needed for: push code to GitHub, create repos, open PRs[/dim]")
-        github_token = Prompt.ask("Enter your GitHub personal access token", password=True)
+    github_result: dict = {}
+    if Confirm.ask("Configure GitHub? (push code, create repos, open PRs)", default=False):
+        github_result = onboard_github()
 
-    notion_token = None
-    notion_parent_page_id = None
-    if Confirm.ask("Configure Notion token?", default=False):
-        console.print("[dim]Needed for: project pages, task tracking, execution logs in Notion[/dim]")
-        console.print("[dim]Get integration token at: https://www.notion.so/profile/integrations[/dim]")
-        notion_token = Prompt.ask("Enter your Notion integration token (secret_xxx)", password=True)
-        console.print("[dim]Parent page ID: open a Notion page → Copy link → extract the ID (32-char hex)[/dim]")
-        notion_parent_page_id = Prompt.ask(
-            "Enter parent Notion page ID (leave blank to configure later)",
-            default=""
-        ) or None
+    notion_result: dict = {}
+    if Confirm.ask("Configure Notion? (project tracking, task management)", default=False):
+        notion_result = onboard_notion(config_mgr)
 
-    slack_token = None
-    slack_channel = None
-    if Confirm.ask("Configure Slack notifications?", default=False):
-        console.print("[dim]Needed for: failure alerts, human-in-the-loop decisions[/dim]")
-        console.print("[dim]Required bot scopes: chat:write, channels:history, channels:read[/dim]")
-        slack_token = Prompt.ask("Enter your Slack bot token (xoxb-...)", password=True)
-        slack_channel = Prompt.ask("Default channel for notifications", default="#codepilot")
+    slack_result: dict = {}
+    if Confirm.ask("Configure Slack? (notifications, human-in-the-loop)", default=False):
+        slack_result = onboard_slack()
 
     # Create configuration
     try:
@@ -185,12 +174,18 @@ def interactive_config_setup() -> bool:
             **create_kwargs
         )
 
-        if github_token:
-            config_mgr.update_github(github_token)
-        if notion_token:
-            config_mgr.update_notion(notion_token, notion_parent_page_id)
-        if slack_token:
-            config_mgr.update_slack(slack_token, slack_channel)
+        if github_result:
+            config_mgr.update_github(github_result.get("token"))
+        if notion_result:
+            config_mgr.update_notion(
+                token=notion_result.get("token"),
+                parent_page_id=notion_result.get("parent_page_id"),
+            )
+        if slack_result:
+            config_mgr.update_slack(
+                bot_token=slack_result.get("bot_token"),
+                channel=slack_result.get("channel", "#codepilot"),
+            )
 
         console.print("\n[green]✓ Configuration created successfully![/green]")
         return True

@@ -283,7 +283,11 @@ def build_codepilot_agent(
 
     def _after_loop_iteration(callback_context) -> None:
         """Record state fingerprint for no-op detection + log elapsed time."""
-        record_iteration_state(dict(callback_context.state))
+        # Pass the State object directly — record_iteration_state only calls
+        # .get() on specific keys, so it doesn't need a plain dict.
+        # dict(callback_context.state) raises KeyError: 0 because ADK's State
+        # lacks keys()/  __iter__ and Python falls back to integer indexing.
+        record_iteration_state(callback_context.state)
         log_iteration_end(callback_context)
 
     # ── Development loop ──────────────────────────────────────────────────

@@ -35,11 +35,25 @@ def check_exit_conditions(tool_context: ToolContext) -> dict:
           summary (str)         — human-readable explanation
     """
     state = tool_context.state
-    app_ready = str(state.get("app_ready", "false")).lower()
-    runtime_error = (state.get("runtime_error") or "").strip()
-    test_result = (state.get("test_result") or "").strip()
-    iteration = int(state.get("iteration_count") or "0")
-    app_type = (state.get("app_type") or "").strip()
+
+    def _str(key: str, default: str = "") -> str:
+        val = state.get(key)
+        return str(val).strip() if val is not None else default
+
+    def _int(key: str, default: int = 0) -> int:
+        val = state.get(key)
+        if val is None:
+            return default
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
+    app_ready = _str("app_ready", "false").lower()
+    runtime_error = _str("runtime_error")
+    test_result = _str("test_result")
+    iteration = _int("iteration_count", 0)
+    app_type = _str("app_type")
 
     blocking = []
 
@@ -55,14 +69,24 @@ def check_exit_conditions(tool_context: ToolContext) -> dict:
     if runtime_error:
         blocking.append(f"runtime_error is set: {runtime_error[:200]}")
 
-    # Condition 4: test result must be PASS or SKIP (never FAIL or empty for web)
+    # Condition 4: test result must be PASS or start with SKIP.
+    # Any other value (FAIL, IN_PROGRESS, empty for web/api) blocks exit.
+    _valid_result = test_result == "PASS" or test_result.startswith("SKIP")
     if test_result.startswith("FAIL"):
-        blocking.append(f"test_result={test_result[:200]}")
-    elif not test_result and app_type in ("web", "fullstack", "api"):
-        blocking.append(
-            f"test_result is empty for app_type={app_type!r} — "
-            "TestAgent has not reported results yet"
-        )
+        blocking.append(f"test_result={test_result[:200]} — tests are failing")
+    elif not _valid_result and app_type in ("web", "fullstack", "api"):
+        if not test_result:
+            blocking.append(
+                f"test_result is empty for app_type={app_type!r} — "
+                "TestAgent has not reported results yet"
+            )
+        else:
+            blocking.append(
+                f"test_result={test_result!r} is not a valid result for app_type={app_type!r}. "
+                "TestAgent must set test_result to exactly 'PASS' or 'SKIP: <reason>'. "
+                "Values like 'IN_PROGRESS' are invalid — the agent is still testing, "
+                "not reporting a final result."
+            )
 
     if not blocking:
         logger.info("Exit conditions met after %d iterations — SUCCESS", iteration)
@@ -101,9 +125,21 @@ def force_exit_conditions(tool_context: ToolContext) -> dict:
         dict with forced_status and summary.
     """
     state = tool_context.state
-    runtime_error = (state.get("runtime_error") or "").strip()
-    test_result = (state.get("test_result") or "").strip()
-    iteration = int(state.get("iteration_count") or "0")
+
+    def _str(key: str) -> str:
+        val = state.get(key)
+        return str(val).strip() if val is not None else ""
+
+    def _int(key: str) -> int:
+        val = state.get(key)
+        try:
+            return int(val) if val is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    runtime_error = _str("runtime_error")
+    test_result = _str("test_result")
+    iteration = _int("iteration_count")
 
     if runtime_error:
         forced_status = f"FAILED: {runtime_error[:300]}"
